@@ -595,7 +595,7 @@ class VoiceNotesApp:
         if "erreur" in lower or "silencieux" in lower or "aucun texte" in lower:
             self.show_error(121, "Erreur inconnue", value, "Consultez les paramètres ou copiez le diagnostic pour obtenir de l'aide.")
         elif "enregistrement" in lower:
-            self.toast.show("Transcription...", "transcribing", duration=3000)
+            self.toast.show("Transcription...", "work", duration=3000)
         elif "collée" in lower:
             self.toast.show("Transcription ajoutée", "success", duration=2000)
         else:
@@ -802,6 +802,7 @@ class VoiceNotesApp:
         """Use Qwen locally when available; raw Whisper text remains the safe fallback."""
         if self.llm_available is False:
             return clean_text(text)
+        self.ui(self.toast.show, "Mise en forme locale...", "refining", 2500)
         payload = json.dumps({
             "model": LLM_MODEL_NAME,
             "stream": False,
@@ -815,6 +816,9 @@ class VoiceNotesApp:
                 data = json.loads(response.read().decode("utf-8"))
             self.llm_available = True
             result = data.get("message", {}).get("content", "").strip()
+            if is_cleanup_prompt_echo(result):
+                self.ui(self.log, f"Qwen a renvoye sa consigne au segment {index}; texte Whisper conserve.")
+                return clean_text(text)
             self.ui(self.log, f"Nettoyage local du segment {index} termine")
             return clean_text(result) if result else clean_text(text)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
@@ -832,6 +836,8 @@ class VoiceNotesApp:
             return
         pyperclip.copy(text + " ")
         if not activate_target(self.paste_target):
+            target_name = self.paste_target.title if self.paste_target else "aucune cible"
+            self.log(f"ERREUR collage : Windows n'a pas active la cible {target_name!r}.")
             self.ui(self.show_error, 121, "Erreur de collage", "Le texte est copie mais la fenetre cible n'a pas ete reactivee.", "Collez le texte manuellement avec Ctrl+V.")
             self.transcribing = False
             return
@@ -918,6 +924,13 @@ def remove_overlap_text(previous: str, current: str) -> str:
     return current
 
 
+def is_cleanup_prompt_echo(text: str) -> bool:
+    """Never append Qwen's system prompt as if it were dictated speech."""
+    normalized = text.casefold()
+    markers = ("conserve le style", "ne resume pas", "retourne uniquement le texte", "erreurs manifestes")
+    return sum(marker in normalized for marker in markers) >= 2
+
+
 def short_toast_text(value: str) -> str:
     """Keep the 296px status tag readable while technical detail stays in the overlay."""
     lower = value.lower()
@@ -974,10 +987,24 @@ def activate_target(target: PasteTarget | None) -> bool:
             time.sleep(FOCUS_SETTLE_SECONDS)
     if user32.IsIconic(target.hwnd):
         user32.ShowWindow(target.hwnd, SW_RESTORE)
-    user32.BringWindowToTop(target.hwnd)
-    user32.SetForegroundWindow(target.hwnd)
-    time.sleep(0.10)
-    return user32.GetForegroundWindow() == target.hwnd
+    foreground = user32.GetForegroundWindow()
+    foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    target_thread = user32.GetWindowThreadProcessId(target.hwnd, None)
+    attached = bool(foreground_thread and target_thread and foreground_thread != target_thread and user32.AttachThreadInput(foreground_thread, target_thread, True))
+    try:
+        user32.BringWindowToTop(target.hwnd)
+        user32.SetForegroundWindow(target.hwnd)
+        user32.SetFocus(target.hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(foreground_thread, target_thread, False)
+    for _attempt in range(8):
+        if user32.GetForegroundWindow() == target.hwnd:
+            return True
+        time.sleep(0.05)
+        user32.BringWindowToTop(target.hwnd)
+        user32.SetForegroundWindow(target.hwnd)
+    return False
 
 
 if __name__ == "__main__":
