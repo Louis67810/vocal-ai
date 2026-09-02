@@ -7,6 +7,8 @@ import os
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import tkinter as tk
 import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,7 +30,11 @@ WHISPER_SAMPLE_RATE = 16_000
 # app silently target the wrong device as soon as an audio interface is added,
 # removed, or its drivers are updated.
 INPUT_DEVICE: int | None = None
-MODEL_NAME = "base"  # More accurate than tiny while remaining practical on CPU.
+MODEL_NAME = "small"  # Better French transcription while remaining viable on an 8 GB PC with INT8 CPU inference.
+LLM_MODEL_NAME = "qwen2.5:1.5b"
+STREAM_CHUNK_SECONDS = 20
+STREAM_OVERLAP_SECONDS = 1.5
+MIN_FINAL_SEGMENT_SECONDS = 1.5
 LANGUAGE = "fr"
 WHISPER_INITIAL_PROMPT = (
     "Ceci est une prise de notes vocale en français. "
@@ -45,6 +51,18 @@ passages ambigus s'ils font partie du discours. Si tu n'es pas certain d'une cor
 garde le texte original."""
 FOCUS_SETTLE_SECONDS = 0.35
 WEB_UI = os.environ.get("VOICE_NOTES_WEB") == "1"
+
+# ASCII source text avoids passing legacy mojibake characters to the local models.
+WHISPER_INITIAL_PROMPT = (
+    "Ceci est une prise de notes vocale en francais. "
+    "Transcris fidelement les phrases prononcees, avec ponctuation. "
+    "Ne traduis pas. Respecte les noms propres, les termes techniques et les nombres."
+)
+CLEANUP_PROMPT = """Corrige cette transcription vocale en francais sans changer le sens.
+Conserve le style, l'ordre, le ton, les hesitations utiles et les passages ambigus.
+Ne resume pas, ne reformule pas et n'ajoute aucune information.
+Corrige uniquement les erreurs manifestes de reconnaissance vocale et retire les repetitions exactes.
+Retourne uniquement le texte nettoye, sans commentaire."""
 
 
 def repair_display_text(value):
@@ -478,6 +496,10 @@ class VoiceNotesApp:
         self.stream: sd.InputStream | None = None
         self.model: WhisperModel | None = None
         self.transcribing = False
+        self.streaming_thread: threading.Thread | None = None
+        self.session_segments: list[str] = []
+        self.session_lock = threading.Lock()
+        self.llm_available: bool | None = None
         self.capture_sample_rate = 48_000
         self.paste_target: PasteTarget | None = None
         self.paste_keyboard = keyboard.Controller()
@@ -639,6 +661,10 @@ class VoiceNotesApp:
             self.stream = sd.InputStream(samplerate=self.capture_sample_rate, channels=1, dtype="float32", device=input_device, callback=callback)
             self.stream.start()
             self.recording = True
+            self.transcribing = True
+            self.session_segments = []
+            self.streaming_thread = threading.Thread(target=self.streaming_transcription_loop, daemon=True)
+            self.streaming_thread.start()
             self.diagnostic.set_recording(True)
             device_name = device_info["name"]
             self.set_status(f"● ENREGISTREMENT ({device_name}, {self.capture_sample_rate} Hz) — refaites Ctrl+Alt+Espace pour terminer")
@@ -647,6 +673,16 @@ class VoiceNotesApp:
             self.show_error(32, "Erreur du microphone", "Le microphone ne peut pas démarrer.", "Vérifiez le micro choisi et les autorisations Windows.")
 
     def stop_recording(self) -> None:
+        """Stop capture; the streaming worker drains the last audio and pastes once ready."""
+        if not self.stream:
+            return
+        self.stream.stop()
+        self.stream.close()
+        self.stream = None
+        self.recording = False
+        self.diagnostic.set_recording(False)
+        self.set_status("Finalisation des derniers segments…")
+        return
         if not self.stream:
             return
         self.stream.stop()
@@ -672,6 +708,106 @@ class VoiceNotesApp:
         self.transcribing = True
         self.set_status(f"Transcription locale en cours ({duration:.1f} s)…")
         threading.Thread(target=self.transcribe_and_paste, args=(audio,), daemon=True).start()
+
+    def streaming_transcription_loop(self) -> None:
+        """Transcribe 20-second slices while recording; retain a short overlap for word boundaries."""
+        audio = np.empty(0, dtype=np.float32)
+        next_end = int(STREAM_CHUNK_SECONDS * self.capture_sample_rate)
+        overlap = int(STREAM_OVERLAP_SECONDS * self.capture_sample_rate)
+        segment_index = 0
+        try:
+            while self.recording or not self.audio_chunks.empty():
+                try:
+                    chunk = self.audio_chunks.get(timeout=0.20)
+                except queue.Empty:
+                    continue
+                audio = np.concatenate((audio, chunk.reshape(-1)))
+                while len(audio) >= next_end:
+                    start = max(0, next_end - int(STREAM_CHUNK_SECONDS * self.capture_sample_rate) - overlap)
+                    segment_index += 1
+                    self.process_stream_segment(audio[start:next_end], segment_index)
+                    next_end += int(STREAM_CHUNK_SECONDS * self.capture_sample_rate)
+
+            last_processed_end = next_end - int(STREAM_CHUNK_SECONDS * self.capture_sample_rate)
+            final_start = max(0, last_processed_end - overlap)
+            final_audio = audio[final_start:]
+            if (len(audio) - last_processed_end) / self.capture_sample_rate >= MIN_FINAL_SEGMENT_SECONDS:
+                segment_index += 1
+                self.process_stream_segment(final_audio, segment_index)
+            self.finish_streaming_session()
+        except Exception as exc:
+            technical = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            self.ui(self.log, f"ERREUR transcription progressive : {technical}")
+            self.ui(self.show_error, 121, "Erreur de transcription", "La transcription progressive n'a pas pu etre terminee.", "Communiquez le code et la reference technique si le probleme persiste.", technical)
+            self.transcribing = False
+
+    def process_stream_segment(self, audio: np.ndarray, index: int) -> None:
+        if self.model is None:
+            self.ui(self.set_status, "Chargement de Whisper Small…")
+            self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+        duration = len(audio) / self.capture_sample_rate
+        resampled = resample_for_whisper(audio, self.capture_sample_rate)
+        self.ui(self.set_status, f"Transcription du segment {index} ({duration:.0f} s)…")
+        segments, _info = self.model.transcribe(
+            resampled, language=LANGUAGE, vad_filter=True, beam_size=5, initial_prompt=WHISPER_INITIAL_PROMPT,
+        )
+        raw = " ".join(segment.text.strip() for segment in segments).strip()
+        if not raw:
+            return
+        with self.session_lock:
+            previous = self.session_segments[-1] if self.session_segments else ""
+        delta = remove_overlap_text(previous, raw)
+        if not delta:
+            return
+        cleaned = self.clean_segment_with_llm(delta, index)
+        with self.session_lock:
+            self.session_segments.append(cleaned)
+        self.ui(self.log, f"Segment {index} : {cleaned}")
+
+    def clean_segment_with_llm(self, text: str, index: int) -> str:
+        """Use Qwen locally when available; raw Whisper text remains the safe fallback."""
+        if self.llm_available is False:
+            return clean_text(text)
+        payload = json.dumps({
+            "model": LLM_MODEL_NAME,
+            "stream": False,
+            "keep_alive": "5m",
+            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 320},
+            "messages": [{"role": "system", "content": CLEANUP_PROMPT}, {"role": "user", "content": text}],
+        }).encode("utf-8")
+        request = urllib.request.Request("http://127.0.0.1:11434/api/chat", data=payload, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            self.llm_available = True
+            result = data.get("message", {}).get("content", "").strip()
+            self.ui(self.log, f"Nettoyage local du segment {index} termine")
+            return clean_text(result) if result else clean_text(text)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            if self.llm_available is not False:
+                self.ui(self.log, f"LLM local indisponible, texte Whisper conserve : {exc}")
+            self.llm_available = False
+            return clean_text(text)
+
+    def finish_streaming_session(self) -> None:
+        with self.session_lock:
+            text = clean_text(" ".join(self.session_segments))
+        if not text:
+            self.ui(self.show_error, 48, "Pas de texte detecte", "Aucune parole exploitable n'a ete detectee.", "Verifiez le micro, son niveau et les autorisations Windows.")
+            self.transcribing = False
+            return
+        pyperclip.copy(text + " ")
+        if not activate_target(self.paste_target):
+            self.ui(self.show_error, 121, "Erreur de collage", "Le texte est copie mais la fenetre cible n'a pas ete reactivee.", "Collez le texte manuellement avec Ctrl+V.")
+            self.transcribing = False
+            return
+        time.sleep(FOCUS_SETTLE_SECONDS)
+        self.paste_keyboard.press(keyboard.Key.ctrl)
+        self.paste_keyboard.press("v")
+        self.paste_keyboard.release("v")
+        self.paste_keyboard.release(keyboard.Key.ctrl)
+        self.ui(self.set_status, "Transcription ajoutee")
+        self.transcribing = False
 
     def transcribe_and_paste(self, audio: np.ndarray) -> None:
         try:
@@ -735,6 +871,17 @@ class VoiceNotesApp:
 def clean_text(text: str) -> str:
     """Reserved for the future local Gemma cleanup step; keeps raw transcription intact for now."""
     return " ".join(text.split())
+
+
+def remove_overlap_text(previous: str, current: str) -> str:
+    """Drop the repeated prefix introduced by the audio overlap, without rewriting speech."""
+    previous_words = previous.split()
+    current_words = current.split()
+    max_overlap = min(30, len(previous_words), len(current_words))
+    for size in range(max_overlap, 2, -1):
+        if [word.casefold().strip(".,!?;:") for word in previous_words[-size:]] == [word.casefold().strip(".,!?;:") for word in current_words[:size]]:
+            return " ".join(current_words[size:])
+    return current
 
 
 def short_toast_text(value: str) -> str:
