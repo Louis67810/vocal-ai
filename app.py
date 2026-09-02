@@ -16,14 +16,14 @@ from faster_whisper import WhisperModel
 from pynput import keyboard
 from pyvda import AppView, VirtualDesktop
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-from web_overlay import WebOverlay
 
 HOTKEY = "<ctrl>+<alt>+<space>"
 EXIT_HOTKEY = "<ctrl>+<alt>+<shift>+<space>"
 WHISPER_SAMPLE_RATE = 16_000
-# The default MME input returns silence on some Intel Smart Sound tablets.
-# Device 9 is this computer's integrated microphone through the newer WASAPI driver.
-INPUT_DEVICE = 9
+# Use the Windows default input device.  Hard-coding a PortAudio index makes the
+# app silently target the wrong device as soon as an audio interface is added,
+# removed, or its drivers are updated.
+INPUT_DEVICE: int | None = None
 MODEL_NAME = "base"  # More accurate than tiny while remaining practical on CPU.
 LANGUAGE = "fr"
 WHISPER_INITIAL_PROMPT = (
@@ -133,7 +133,7 @@ class Toast:
         self.visible = True
         self._slide_in(0)
         if kind == "work":
-            self._shimmer(text_color)
+            self._shimmer("")
         if duration is not None:
             self.after_id = self.root.after(duration, self.hide)
 
@@ -224,12 +224,15 @@ class VoiceNotesApp:
         self.last_hotkey_at = 0.0
         self.logs: list[str] = []
         self.screen_width = self.screen_height = 0
-        self.overlay = WebOverlay(self)
-        self.toast = self.overlay
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.error_overlay = ErrorOverlay(self.root, self.logs)
+        self.toast = Toast(self.root, self.error_overlay.show)
         self.listener = None
 
     def ui(self, callback, *args) -> None:
-        callback(*args)
+        self.root.after(0, callback, *args)
 
     def screen_size(self) -> tuple[int, int]:
         return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
@@ -300,10 +303,11 @@ class VoiceNotesApp:
                     self.ui(self.log, f"Audio : {status}")
                 self.audio_chunks.put(indata.copy())
 
-            device_info = sd.query_devices(INPUT_DEVICE)
+            input_device = INPUT_DEVICE if INPUT_DEVICE is not None else sd.default.device[0]
+            device_info = sd.query_devices(input_device)
             # Use the sample rate supported by the hardware, then resample for Whisper.
             self.capture_sample_rate = int(device_info["default_samplerate"])
-            self.stream = sd.InputStream(samplerate=self.capture_sample_rate, channels=1, dtype="float32", device=INPUT_DEVICE, callback=callback)
+            self.stream = sd.InputStream(samplerate=self.capture_sample_rate, channels=1, dtype="float32", device=input_device, callback=callback)
             self.stream.start()
             self.recording = True
             device_name = device_info["name"]
@@ -380,10 +384,15 @@ class VoiceNotesApp:
             self.stream.close()
         if self.listener:
             self.listener.stop()
-        self.overlay.close()
+        self.error_overlay.close()
+        if self.toast.window.winfo_exists():
+            self.toast.window.destroy()
+        if self.root.winfo_exists():
+            self.root.destroy()
 
     def run(self) -> None:
-        self.overlay.run()
+        self.root.after(0, self.on_ui_ready)
+        self.root.mainloop()
 
 
 def clean_text(text: str) -> str:

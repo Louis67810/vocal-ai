@@ -6,15 +6,16 @@ echo === Installation OneNote Voice Notes ===
 echo.
 where py >nul 2>nul
 if not errorlevel 1 (
-  py -3 -m venv .venv
-  goto install
+  py -3.12 -m venv .venv >nul 2>nul && goto install
+  py -3.11 -m venv .venv >nul 2>nul && goto install
+  py -3.10 -m venv .venv >nul 2>nul && goto install
 )
 if exist "%LocalAppData%\Programs\Python\Python312\python.exe" (
   "%LocalAppData%\Programs\Python\Python312\python.exe" -m venv .venv
   goto install
 )
-echo Python Launcher ^(py^) introuvable.
-echo Le Python actuellement present est Anaconda 3.8.3, trop ancien pour Whisper.
+echo Aucune version compatible de Python n'a ete trouvee.
+echo Python 3.10, 3.11 ou 3.12 est necessaire. Python 3.13 et 3.14 ne sont pas pris en charge par ce projet.
 echo.
 echo Installez Python 3.10, 3.11 ou 3.12 pour votre utilisateur,
 echo cochez "Add python.exe to PATH", puis relancez ce fichier.
