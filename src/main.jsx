@@ -27,7 +27,7 @@ function App() {
     fetch('http://127.0.0.1:8765/toggle', { method: 'POST', body: '{}' })
   }
 
-  if (isToast) return <main className="toast-surface">{notice && <div className={`toast ${notice.kind}`}><span className="toast-icon">{notice.app ? <img src={`/${notice.app === 'word' ? '0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png' : 'af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png'}`} /> : <Icon name={notice.kind === 'success' ? 'check' : 'mic'} />}</span><span className={notice.kind === 'work' ? 'shimmer' : ''}>{notice.text}</span></div>}</main>
+  if (isToast) return <main className="toast-surface">{notice && <div className={`toast ${notice.kind}`}><span className="toast-icon">{notice.app ? <img src={`./${notice.app === 'word' ? '0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png' : 'af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png'}`} /> : <Icon name={notice.kind === 'success' ? 'check' : 'mic'} />}</span><span className={notice.kind === 'work' ? 'shimmer' : ''}>{notice.text}</span></div>}</main>
 
   return <main className="app-shell">
     <section className="control-card">
