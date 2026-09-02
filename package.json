@@ -9,11 +9,11 @@
     "start": "npm run build && electron ."
   },
   "dependencies": {
+    "@heroicons/react": "^2.2.0",
     "@vitejs/plugin-react": "latest",
     "electron": "latest",
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest"
-  },
-  "devDependencies": {}
+  }
 }
