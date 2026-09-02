@@ -12,6 +12,7 @@ function Icon({ name, className = '' }) {
 }
 
 function App() {
+  const isToast = new URLSearchParams(window.location.search).get('surface') === 'toast'
   const [recording, setRecording] = useState(false)
   const [shortcut, setShortcut] = useState('Ctrl+Alt+Espace')
   const [notice, setNotice] = useState(null)
@@ -26,6 +27,8 @@ function App() {
     fetch('http://127.0.0.1:8765/toggle', { method: 'POST', body: '{}' })
   }
 
+  if (isToast) return <main className="toast-surface">{notice && <div className={`toast ${notice.kind}`}><span className="toast-icon">{notice.app ? <img src={`/${notice.app === 'word' ? '0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png' : 'af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png'}`} /> : <Icon name={notice.kind === 'success' ? 'check' : 'mic'} />}</span><span className={notice.kind === 'work' ? 'shimmer' : ''}>{notice.text}</span></div>}</main>
+
   return <main className="app-shell">
     <section className="control-card">
       <header><p className="eyebrow">VOICE NOTES</p><h1>Commandes et journal</h1><p>Le bouton reste disponible même si le raccourci clavier ne répond pas.</p></header>
@@ -35,7 +38,6 @@ function App() {
       <div className="shortcut"><label htmlFor="shortcut">Raccourci global</label><div><input id="shortcut" value={shortcut} onChange={(e) => setShortcut(e.target.value)} /><button onClick={() => fetch('http://127.0.0.1:8765/hotkey', { method: 'POST', body: JSON.stringify({ value: shortcut }) })}>Appliquer</button></div><small>Exemple : Ctrl+Shift+R</small></div>
       <div className="logs" aria-live="polite">{logs.map((line, i) => <p key={i}>{line}</p>)}</div>
     </section>
-    {notice && <div className={`toast ${notice.kind}`}><span className="toast-icon">{notice.app ? <img src={`/${notice.app === 'word' ? '0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png' : 'af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png'}`} /> : <Icon name={notice.kind === 'success' ? 'check' : 'mic'} />}</span><span className={notice.kind === 'work' ? 'shimmer' : ''}>{notice.text}</span></div>}
   </main>
 }
 
