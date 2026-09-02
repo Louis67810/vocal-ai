@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { CheckIcon, EllipsisHorizontalIcon, ExclamationTriangleIcon, MicrophoneIcon, SpeakerWaveIcon } from '@heroicons/react/24/solid'
+import { CheckIcon, EllipsisHorizontalIcon, ExclamationTriangleIcon, InformationCircleIcon, MicrophoneIcon, SpeakerWaveIcon } from '@heroicons/react/24/solid'
 import './styles.css'
 
 const officeAsset = { word: './0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png', onenote: './af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png' }
@@ -14,7 +14,27 @@ function StatusIcon({ notice }) {
   return <EllipsisHorizontalIcon />
 }
 
-function Toast({ notice, leaving }) { return <div className={`toast ${notice.kind} ${leaving ? 'leaving' : ''}`}><span className="toast-icon"><StatusIcon notice={notice} /></span><span className={notice.kind === 'work' ? 'shimmer' : ''}>{notice.text}</span></div> }
+function ErrorOverlay({ details }) {
+  if (!details) return null
+  return <section className="error-overlay" role="status" aria-label={`Détails de l’erreur ${details.code}`}>
+    <p><strong>{details.message}</strong><span> {details.help}</span></p>
+    {details.technical && <small>Référence technique : {details.technical}</small>}
+  </section>
+}
+
+function Toast({ notice, leaving }) {
+  const [isInfoOpen, setInfoOpen] = useState(false)
+  useEffect(() => setInfoOpen(false), [notice?.details?.code, notice?.text])
+  const isError = notice.kind === 'error'
+  return <>
+    {isError && isInfoOpen && <ErrorOverlay details={notice.details} />}
+    <div className={`toast ${notice.kind} ${leaving ? 'leaving' : ''}`}>
+      <span className="toast-icon"><StatusIcon notice={notice} /></span>
+      <span className={notice.kind === 'work' ? 'shimmer' : ''}>{notice.text}</span>
+      {isError && <button className="toast-info" type="button" aria-label={`Voir l’aide pour l’erreur ${notice.details?.code ?? ''}`} aria-expanded={isInfoOpen} onClick={() => setInfoOpen(open => !open)}><InformationCircleIcon /></button>}
+    </div>
+  </>
+}
 
 function App() {
   const isToast = new URLSearchParams(window.location.search).get('surface') === 'toast'

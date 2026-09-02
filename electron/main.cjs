@@ -21,11 +21,12 @@ function createWindow() {
   })
   controlWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   toastWindow = new BrowserWindow({
-    width: 296, height: 160, frame: false, transparent: true, backgroundColor: '#00000000', resizable: false,
+    width: 373, height: 200, frame: false, transparent: true, backgroundColor: '#00000000', resizable: false,
     alwaysOnTop: true, skipTaskbar: true, focusable: false,
     webPreferences: { contextIsolation: true, nodeIntegration: false },
   })
-  toastWindow.setPosition(Math.round((require('electron').screen.getPrimaryDisplay().workAreaSize.width - 296) / 2), require('electron').screen.getPrimaryDisplay().workAreaSize.height - 122)
+  const workArea = require('electron').screen.getPrimaryDisplay().workArea
+  toastWindow.setPosition(Math.round(workArea.x + (workArea.width - 373) / 2), workArea.y + workArea.height - 199)
   toastWindow.loadFile(path.join(__dirname, '..', 'dist', 'toast.html'), { query: { surface: 'toast' } })
 }
 

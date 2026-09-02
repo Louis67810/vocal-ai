@@ -560,8 +560,8 @@ class VoiceNotesApp:
         else:
             self.toast.show(short_toast_text(value), "work", duration=None if "cours" in lower or "chargement" in lower else 3000)
 
-    def show_error(self, code: int, title: str, message: str, help_text: str) -> None:
-        details = {"code": code, "title": title, "message": message, "help": help_text}
+    def show_error(self, code: int, title: str, message: str, help_text: str, technical: str | None = None) -> None:
+        details = {"code": code, "title": title, "message": message, "help": help_text, "technical": technical}
         self.toast.show(f"{title} : #{code}", "error", duration=12000, details=details)
 
     def log(self, message: str) -> None:
