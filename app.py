@@ -43,6 +43,13 @@ garde le texte original."""
 FOCUS_SETTLE_SECONDS = 0.35
 
 
+def apply_rounded_window_region(window: tk.Toplevel, width: int, height: int, radius: int) -> None:
+    """Use a native Windows clip instead of magenta chroma-key transparency."""
+    window.update_idletasks()
+    region = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius)
+    ctypes.windll.user32.SetWindowRgn(window.winfo_id(), region, True)
+
+
 @dataclass
 class PasteTarget:
     hwnd: int
@@ -62,15 +69,12 @@ class Toast:
     def __init__(self, root: tk.Tk, open_details) -> None:
         self.root = root
         self.open_details = open_details
-        self.window = tk.Toplevel(root, bg="#ff00ff")
+        self.window = tk.Toplevel(root, bg="#ffffff")
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
-        try:
-            self.window.wm_attributes("-transparentcolor", "#ff00ff")
-        except tk.TclError:
-            self.window.configure(bg="#ffffff")
-        self.canvas = tk.Canvas(self.window, width=self.WIDTH, height=self.HEIGHT, highlightthickness=0, bg="#ff00ff")
+        self.canvas = tk.Canvas(self.window, width=self.WIDTH, height=self.HEIGHT, highlightthickness=0, bg="#ffffff")
         self.canvas.pack()
+        self.window.after_idle(apply_rounded_window_region, self.window, self.WIDTH, self.HEIGHT, self.HEIGHT)
         self.after_id: str | None = None
         self.shimmer_id: str | None = None
         self.shimmer_phase = 0
@@ -101,6 +105,31 @@ class Toast:
         filename = "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf"
         return ImageFont.truetype(filename, size)
 
+    def _draw_status_icon(self, draw: ImageDraw.ImageDraw, kind: str, ink: str, scale: int) -> None:
+        """16px status glyphs, drawn at 4x to keep the Figma tag edges crisp."""
+        xy = lambda value: int(value * scale)
+        if kind == "recording":
+            draw.rounded_rectangle((xy(19), xy(12), xy(27), xy(25)), radius=xy(4), fill=ink)
+            draw.arc((xy(15), xy(16), xy(31), xy(31)), 0, 180, fill=ink, width=xy(2))
+            draw.line((xy(23), xy(30), xy(23), xy(34)), fill=ink, width=xy(2))
+            draw.line((xy(19), xy(34), xy(27), xy(34)), fill=ink, width=xy(2))
+        elif kind == "success":
+            draw.polygon([(xy(16), xy(23)), (xy(21), xy(28)), (xy(31), xy(17)), (xy(31), xy(22)), (xy(21), xy(33)), (xy(16), xy(28))], fill=ink)
+        elif kind == "error":
+            code = (self.error_details or {}).get("code")
+            if code == 32:
+                draw.rounded_rectangle((xy(19), xy(12), xy(27), xy(25)), radius=xy(4), fill=ink)
+                draw.arc((xy(15), xy(16), xy(31), xy(31)), 0, 180, fill=ink, width=xy(2))
+                draw.line((xy(23), xy(30), xy(23), xy(34)), fill=ink, width=xy(2))
+            elif code == 48:
+                draw.polygon([(xy(15), xy(20)), (xy(20), xy(20)), (xy(27), xy(14)), (xy(27), xy(30)), (xy(20), xy(25)), (xy(15), xy(25))], fill=ink)
+                draw.arc((xy(23), xy(17), xy(33), xy(29)), -60, 60, fill=ink, width=xy(2))
+            else:
+                draw.polygon([(xy(23), xy(13)), (xy(32), xy(30)), (xy(14), xy(30))], fill=ink)
+                draw.text((xy(23), xy(24)), "!", anchor="mm", fill="#FFFFFF", font=self._font(xy(10), True))
+        else:
+            draw.ellipse((xy(20), xy(20), xy(26), xy(26)), fill=ink)
+
     def _render(self, text: str, kind: str, text_color: str | None = None) -> None:
         """Draw at 4x then downsample: native Tk canvas arcs are visibly pixelated."""
         scale = 4
@@ -118,13 +147,15 @@ class Toast:
         else:
             bubble, ink, symbol, color = "#F4F4F4", "#6E6E6E", "•", "#454545"
         draw.ellipse((xy(7), xy(7), xy(39), xy(39)), fill=bubble)
+        if kind == "success" and self.target_app:
+            bubble = "#F4F4F4"
+            draw.ellipse((xy(7), xy(7), xy(39), xy(39)), fill=bubble)
         app_icon = self.app_icons.get(self.target_app or "") if kind == "success" else None
         if app_icon:
             logo = app_icon.resize((xy(16), xy(16)), Image.Resampling.LANCZOS)
             image.alpha_composite(logo, (xy(15), xy(15)))
         else:
-            icon_font = self._font(xy(16 if kind != "work" else 22), True)
-            draw.text((xy(23), xy(22)), symbol, anchor="mm", fill=ink, font=icon_font)
+            self._draw_status_icon(draw, kind, ink, scale)
         draw.text((xy(47), xy(23)), text, anchor="lm", fill=text_color or color, font=self._font(xy(11), True))
         if kind == "error":
             draw.ellipse((xy(261), xy(13), xy(281), xy(33)), fill="#756767")
@@ -226,6 +257,7 @@ class ErrorOverlay:
         self.card.overrideredirect(True)
         self.card.attributes("-topmost", True)
         self.card.geometry("373x275+108+461")
+        self.card.after_idle(apply_rounded_window_region, self.card, 373, 275, 48)
         self.card.bind("<Button-1>", self._drag_start)
         self.card.bind("<B1-Motion>", self._drag_move)
         frame = tk.Frame(self.card, bg="#191919", padx=24, pady=20)
