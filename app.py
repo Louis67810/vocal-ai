@@ -1,0 +1,457 @@
+"""Local voice-to-OneNote helper. No cloud API is used after Whisper is cached."""
+from __future__ import annotations
+
+import queue
+import threading
+import time
+import traceback
+import tkinter as tk
+import ctypes
+from dataclasses import dataclass
+
+import numpy as np
+import pyperclip
+import sounddevice as sd
+from faster_whisper import WhisperModel
+from pynput import keyboard
+from pyvda import AppView, VirtualDesktop
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+from web_overlay import WebOverlay
+
+HOTKEY = "<ctrl>+<alt>+<space>"
+EXIT_HOTKEY = "<ctrl>+<alt>+<shift>+<space>"
+WHISPER_SAMPLE_RATE = 16_000
+# The default MME input returns silence on some Intel Smart Sound tablets.
+# Device 9 is this computer's integrated microphone through the newer WASAPI driver.
+INPUT_DEVICE = 9
+MODEL_NAME = "base"  # More accurate than tiny while remaining practical on CPU.
+LANGUAGE = "fr"
+WHISPER_INITIAL_PROMPT = (
+    "Ceci est une prise de notes vocale en français. "
+    "Transcris fidèlement les phrases prononcées, avec ponctuation et accents. "
+    "Ne traduis pas. Respecte les noms propres, les termes techniques et les nombres."
+)
+CLEANUP_PROMPT = """Corrige cette transcription vocale française en conservant exactement le style,
+l'ordre, le ton et les formulations de la personne qui parle. Ne résume pas, ne reformule
+pas et n'ajoute aucune information. Corrige uniquement les erreurs manifestes de
+reconnaissance vocale lorsque le contexte permet d'identifier avec certitude le mot voulu.
+Supprime uniquement les répétitions exactes, les mots clairement parasites ou les fragments
+provenant de paroles superposées. Conserve les hésitations, les phrases incomplètes et les
+passages ambigus s'ils font partie du discours. Si tu n'es pas certain d'une correction,
+garde le texte original."""
+FOCUS_SETTLE_SECONDS = 0.35
+
+
+@dataclass
+class PasteTarget:
+    hwnd: int
+    title: str
+    desktop_number: int | None
+
+
+class Toast:
+    """A 296x46 status tag, deliberately kept separate from the diagnostic overlay."""
+    WIDTH, HEIGHT = 296, 46
+
+    def __init__(self, root: tk.Tk, open_details) -> None:
+        self.root = root
+        self.open_details = open_details
+        self.window = tk.Toplevel(root, bg="#ff00ff")
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        try:
+            self.window.wm_attributes("-transparentcolor", "#ff00ff")
+        except tk.TclError:
+            self.window.configure(bg="#ffffff")
+        self.canvas = tk.Canvas(self.window, width=self.WIDTH, height=self.HEIGHT, highlightthickness=0, bg="#ff00ff")
+        self.canvas.pack()
+        self.after_id: str | None = None
+        self.shimmer_id: str | None = None
+        self.shimmer_phase = 0
+        self.visible = False
+        self.error_details: dict | None = None
+        self.photo: ImageTk.PhotoImage | None = None
+        self.current_text = ""
+        self.current_kind = "work"
+        self.canvas.bind("<Button-1>", self._click)
+        self.window.withdraw()
+
+    def _position(self, hidden: bool = False) -> tuple[int, int]:
+        x = (self.root.winfo_screenwidth() - self.WIDTH) // 2
+        bottom = 76
+        y = self.root.winfo_screenheight() - bottom - self.HEIGHT
+        return x, self.root.winfo_screenheight() + 4 if hidden else y
+
+    @staticmethod
+    def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+        filename = "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf"
+        return ImageFont.truetype(filename, size)
+
+    def _render(self, text: str, kind: str, text_color: str | None = None) -> None:
+        """Draw at 4x then downsample: native Tk canvas arcs are visibly pixelated."""
+        scale = 4
+        size = (self.WIDTH * scale, self.HEIGHT * scale)
+        image = Image.new("RGBA", size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        xy = lambda value: int(value * scale)
+        draw.rounded_rectangle((0, 0, xy(self.WIDTH) - 1, xy(self.HEIGHT) - 1), radius=xy(23), fill="#FFFFFF", outline=(0, 0, 0, 38), width=xy(1))
+        if kind == "error":
+            bubble, ink, symbol, color = "#FFF0F0", "#D43333", "!", "#963333"
+        elif kind == "recording":
+            bubble, ink, symbol, color = "#E6F4FF", "#69A2D1", "●", "#3E6E94"
+        elif kind == "success":
+            bubble, ink, symbol, color = "#EAF8EF", "#318452", "✓", "#318452"
+        else:
+            bubble, ink, symbol, color = "#F4F4F4", "#6E6E6E", "•", "#454545"
+        draw.ellipse((xy(7), xy(7), xy(39), xy(39)), fill=bubble)
+        icon_font = self._font(xy(16 if kind != "work" else 22), True)
+        draw.text((xy(23), xy(22)), symbol, anchor="mm", fill=ink, font=icon_font)
+        draw.text((xy(47), xy(23)), text, anchor="lm", fill=text_color or color, font=self._font(xy(11), True))
+        if kind == "error":
+            draw.ellipse((xy(261), xy(13), xy(281), xy(33)), fill="#756767")
+            draw.text((xy(271), xy(23)), "?", anchor="mm", fill="#FFFFFF", font=self._font(xy(11), True))
+        image = image.resize((self.WIDTH, self.HEIGHT), Image.Resampling.LANCZOS)
+        self.photo = ImageTk.PhotoImage(image)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+
+    def _click(self, event) -> None:
+        if self.current_kind == "error" and event.x >= 250:
+            self.open_details(self.error_details)
+
+    def show(self, text: str, kind: str = "work", duration: int | None = 3000, details: dict | None = None) -> None:
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+        if self.shimmer_id:
+            self.root.after_cancel(self.shimmer_id)
+            self.shimmer_id = None
+        self.error_details = details
+        self.current_text, self.current_kind = text, kind
+        self._render(text, kind)
+        self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{self._position(True)[0]}+{self._position(True)[1]}")
+        self.window.deiconify()
+        self.visible = True
+        self._slide_in(0)
+        if kind == "work":
+            self._shimmer(text_color)
+        if duration is not None:
+            self.after_id = self.root.after(duration, self.hide)
+
+    def _slide_in(self, step: int) -> None:
+        x, target_y = self._position()
+        _, start_y = self._position(True)
+        y = int(start_y + (target_y - start_y) * min(step, 12) / 12)
+        self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        if step < 12:
+            self.root.after(12, self._slide_in, step + 1)
+
+    def _shimmer(self, base: str) -> None:
+        colors = ("#232323", "#545454", "#8C8C8C", "#545454")
+        self._render(self.current_text, self.current_kind, colors[self.shimmer_phase % len(colors)])
+        self.shimmer_phase += 1
+        self.shimmer_id = self.root.after(110, self._shimmer, base)
+
+    def hide(self) -> None:
+        if self.shimmer_id:
+            self.root.after_cancel(self.shimmer_id)
+            self.shimmer_id = None
+        self.window.withdraw()
+        self.visible = False
+
+
+class ErrorOverlay:
+    """A draggable dark details card; it only exists while the error help is open."""
+    def __init__(self, root: tk.Tk, logs: list[str]) -> None:
+        self.root, self.logs = root, logs
+        self.shade: tk.Toplevel | None = None
+        self.card: tk.Toplevel | None = None
+        self.drag = (0, 0)
+
+    def show(self, details: dict | None) -> None:
+        if not details:
+            return
+        self.close()
+        self.shade = tk.Toplevel(self.root, bg="#000000")
+        self.shade.overrideredirect(True)
+        self.shade.attributes("-alpha", 0.42, "-topmost", True)
+        self.shade.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
+        self.shade.bind("<Button-1>", lambda _event: self.close())
+        self.card = tk.Toplevel(self.root, bg="#191919")
+        self.card.overrideredirect(True)
+        self.card.attributes("-topmost", True)
+        self.card.geometry("373x275+108+443")
+        self.card.bind("<Button-1>", self._drag_start)
+        self.card.bind("<B1-Motion>", self._drag_move)
+        frame = tk.Frame(self.card, bg="#191919", padx=24, pady=20)
+        frame.pack(fill="both", expand=True)
+        tk.Button(frame, text="×", command=self.close, bg="#191919", fg="#FFFFFF", bd=0, activebackground="#191919", activeforeground="#FFFFFF", font=("Inter", 18, "bold"), cursor="hand2").place(x=0, y=-6)
+        tk.Label(frame, text=details["title"], bg="#191919", fg="#FFFFFF", font=("Inter", 13, "bold")).pack(anchor="w", padx=(28, 0))
+        tk.Frame(frame, height=1, bg="#303030").pack(fill="x", pady=(16, 14))
+        tk.Label(frame, text=details["message"], bg="#191919", fg="#FFFFFF", justify="left", wraplength=310, font=("Inter", 10, "bold")).pack(anchor="w")
+        tk.Frame(frame, height=1, bg="#303030").pack(fill="x", pady=14)
+        hint = "Clique ici pour copier le diagnostic technique"
+        copy = tk.Label(frame, text=f"{details['help']}\n\n{hint}", bg="#191919", fg="#A8A8A8", justify="left", wraplength=310, font=("Inter", 10), cursor="hand2")
+        copy.pack(anchor="w")
+        copy.bind("<Button-1>", lambda _event: self.copy(details))
+
+    def copy(self, details: dict) -> None:
+        pyperclip.copy("\n".join(self.logs[-20:]) + f"\nCode : #{details['code']}")
+
+    def _drag_start(self, event) -> None:
+        self.drag = (event.x_root - self.card.winfo_x(), event.y_root - self.card.winfo_y())
+
+    def _drag_move(self, event) -> None:
+        if self.card:
+            self.card.geometry(f"+{event.x_root-self.drag[0]}+{event.y_root-self.drag[1]}")
+
+    def close(self) -> None:
+        for window in (self.card, self.shade):
+            if window and window.winfo_exists():
+                window.destroy()
+        self.card = self.shade = None
+
+
+class VoiceNotesApp:
+    def __init__(self) -> None:
+        self.recording = False
+        self.audio_chunks: queue.Queue[np.ndarray] = queue.Queue()
+        self.stream: sd.InputStream | None = None
+        self.model: WhisperModel | None = None
+        self.transcribing = False
+        self.capture_sample_rate = 48_000
+        self.paste_target: PasteTarget | None = None
+        self.paste_keyboard = keyboard.Controller()
+        self.last_hotkey_at = 0.0
+        self.logs: list[str] = []
+        self.screen_width = self.screen_height = 0
+        self.overlay = WebOverlay(self)
+        self.toast = self.overlay
+        self.listener = None
+
+    def ui(self, callback, *args) -> None:
+        callback(*args)
+
+    def screen_size(self) -> tuple[int, int]:
+        return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
+
+    def on_ui_ready(self) -> None:
+        self.log(f"Application démarrée. Raccourci : {HOTKEY}")
+        self.log("Mode local : Whisper Base est chargé depuis le cache local.")
+        self.listener = keyboard.GlobalHotKeys({HOTKEY: self.on_hotkey, EXIT_HOTKEY: self.request_exit})
+        self.listener.start()
+        self.toast.show("Prêt — Ctrl + Alt + Espace", "work", duration=3000)
+
+    def copy_diagnostic(self) -> None:
+        pyperclip.copy("\n".join(self.logs[-20:]))
+
+    def set_status(self, value: str) -> None:
+        self.log(value)
+        lower = value.lower()
+        if "erreur" in lower or "silencieux" in lower or "aucun texte" in lower:
+            self.show_error(121, "Erreur inconnue", value, "Consultez les paramètres ou copiez le diagnostic pour obtenir de l'aide.")
+        elif "enregistrement" in lower:
+            self.toast.show("Écoute de la question", "recording", duration=None)
+        elif "collée" in lower:
+            self.toast.show("Transcription ajoutée", "success", duration=2000)
+        else:
+            self.toast.show(short_toast_text(value), "work", duration=None if "cours" in lower or "chargement" in lower else 3000)
+
+    def show_error(self, code: int, title: str, message: str, help_text: str) -> None:
+        details = {"code": code, "title": title, "message": message, "help": help_text}
+        self.toast.show(f"{title} : #{code}", "error", duration=12000, details=details)
+
+    def log(self, message: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        self.logs.append(f"[{stamp}] {message}")
+        self.logs[:] = self.logs[-100:]
+
+    def on_hotkey(self) -> None:
+        now = time.monotonic()
+        if now - self.last_hotkey_at < 0.35:
+            return
+        self.last_hotkey_at = now
+        self.ui(self.toggle_recording)
+
+    def request_exit(self) -> None:
+        self.ui(self.close)
+
+    def toggle_recording(self) -> None:
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self) -> None:
+        if self.transcribing:
+            self.set_status("Transcription encore en cours — attendez le résultat")
+            return
+        try:
+            self.paste_target = remember_active_window()
+            if self.paste_target:
+                desktop = self.paste_target.desktop_number
+                self.log(f"Cible mémorisée : {self.paste_target.title} (bureau {desktop or '?'})")
+            else:
+                self.log("ATTENTION : aucune fenêtre cible n'a pu être mémorisée")
+            while not self.audio_chunks.empty():
+                self.audio_chunks.get_nowait()
+
+            def callback(indata, frames, time_info, status) -> None:
+                if status:
+                    self.ui(self.log, f"Audio : {status}")
+                self.audio_chunks.put(indata.copy())
+
+            device_info = sd.query_devices(INPUT_DEVICE)
+            # Use the sample rate supported by the hardware, then resample for Whisper.
+            self.capture_sample_rate = int(device_info["default_samplerate"])
+            self.stream = sd.InputStream(samplerate=self.capture_sample_rate, channels=1, dtype="float32", device=INPUT_DEVICE, callback=callback)
+            self.stream.start()
+            self.recording = True
+            device_name = device_info["name"]
+            self.set_status(f"● ENREGISTREMENT ({device_name}, {self.capture_sample_rate} Hz) — refaites Ctrl+Alt+Espace pour terminer")
+        except Exception as exc:
+            self.log(f"ERREUR micro : {exc}")
+            self.show_error(32, "Erreur du microphone", "Le microphone ne peut pas démarrer.", "Vérifiez le micro choisi et les autorisations Windows.")
+
+    def stop_recording(self) -> None:
+        if not self.stream:
+            return
+        self.stream.stop()
+        self.stream.close()
+        self.stream = None
+        self.recording = False
+        chunks = []
+        while not self.audio_chunks.empty():
+            chunks.append(self.audio_chunks.get_nowait())
+        if not chunks:
+            self.show_error(48, "Pas de son entendu", "Aucun son n'est arrivé à l'application.", "Vérifiez que Microphone Array n'est pas coupé dans Paramètres > Son > Entrée.")
+            return
+        audio = np.concatenate(chunks, axis=0).reshape(-1)
+        duration = len(audio) / self.capture_sample_rate
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        dbfs = 20 * np.log10(max(rms, 1e-10))
+        self.log(f"Niveau microphone reçu : {dbfs:.1f} dBFS (plus grand que -45 dBFS en parlant est normal)")
+        if dbfs < -55:
+            self.show_error(48, "Pas de son entendu", "Le signal du microphone est presque silencieux.", "Vérifiez le volume et les autorisations dans Paramètres > Confidentialité > Microphone.")
+            return
+        audio = resample_for_whisper(audio, self.capture_sample_rate)
+        self.transcribing = True
+        self.set_status(f"Transcription locale en cours ({duration:.1f} s)…")
+        threading.Thread(target=self.transcribe_and_paste, args=(audio,), daemon=True).start()
+
+    def transcribe_and_paste(self, audio: np.ndarray) -> None:
+        try:
+            if self.model is None:
+                self.ui(self.set_status, "Chargement de Whisper Base…")
+                self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+            segments, info = self.model.transcribe(
+                audio,
+                language=LANGUAGE,
+                vad_filter=True,
+                beam_size=5,
+                initial_prompt=WHISPER_INITIAL_PROMPT,
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            if not text:
+                self.ui(self.show_error, 48, "Pas de texte détecté", "Whisper n'a reconnu aucune parole exploitable.", "Parlez plus près du microphone et vérifiez que le niveau sonore bouge.")
+                return
+            text = clean_text(text)
+            self.ui(self.log, f"Texte : {text}")
+            pyperclip.copy(text + " ")
+            if not activate_target(self.paste_target):
+                self.ui(self.show_error, 121, "Erreur de collage", "Le texte a été copié, mais Windows n'a pas réactivé la fenêtre cible.", "Le texte est dans le presse-papiers : collez-le manuellement avec Ctrl+V.")
+                return
+            target_title = self.paste_target.title if self.paste_target else "la fenêtre cible"
+            self.ui(self.log, f"Fenêtre réactivée : {target_title}")
+            time.sleep(FOCUS_SETTLE_SECONDS)
+            self.paste_keyboard.press(keyboard.Key.ctrl)
+            self.paste_keyboard.press("v")
+            self.paste_keyboard.release("v")
+            self.paste_keyboard.release(keyboard.Key.ctrl)
+            self.ui(self.set_status, f"✓ Transcription collée dans : {target_title}")
+        except Exception as exc:
+            details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            self.ui(self.log, f"ERREUR transcription : {details}")
+            self.ui(self.show_error, 121, "Erreur de transcription", "La transcription n'a pas pu être terminée.", "Cliquez sur ? pour copier le diagnostic et me l'envoyer.")
+        finally:
+            self.transcribing = False
+
+    def close(self) -> None:
+        if self.stream:
+            self.stream.close()
+        if self.listener:
+            self.listener.stop()
+        self.overlay.close()
+
+    def run(self) -> None:
+        self.overlay.run()
+
+
+def clean_text(text: str) -> str:
+    """Reserved for the future local Gemma cleanup step; keeps raw transcription intact for now."""
+    return " ".join(text.split())
+
+
+def short_toast_text(value: str) -> str:
+    """Keep the 296px status tag readable while technical detail stays in the overlay."""
+    lower = value.lower()
+    if "chargement" in lower:
+        return "Chargement du modèle..."
+    if "transcription" in lower:
+        return "Transcription..."
+    if "cible" in lower:
+        return "Préparation de la note..."
+    return value[:32] + ("..." if len(value) > 32 else "")
+
+
+def resample_for_whisper(audio: np.ndarray, source_rate: int) -> np.ndarray:
+    """Small dependency-free mono resampler; Whisper expects 16 kHz float audio."""
+    if source_rate == WHISPER_SAMPLE_RATE:
+        return audio
+    target_length = round(len(audio) * WHISPER_SAMPLE_RATE / source_rate)
+    source_positions = np.arange(len(audio), dtype=np.float64)
+    target_positions = np.linspace(0, len(audio) - 1, target_length)
+    return np.interp(target_positions, source_positions, audio).astype(np.float32)
+
+
+def window_title(hwnd: int) -> str:
+    """Read a top-level Windows window title without needing an extra dependency."""
+    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return buffer.value or "Fenêtre sans titre"
+
+
+def remember_active_window() -> PasteTarget | None:
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    try:
+        desktop_number = AppView(hwnd=hwnd).desktop.number
+    except Exception:
+        # Standard paste still works if Windows does not expose a desktop for this window.
+        desktop_number = None
+    return PasteTarget(hwnd=hwnd, title=window_title(hwnd), desktop_number=desktop_number)
+
+
+def activate_target(target: PasteTarget | None) -> bool:
+    """Restore the target (if minimized), bring it forward and confirm Windows accepted it."""
+    if target is None or not ctypes.windll.user32.IsWindow(target.hwnd):
+        return False
+    user32 = ctypes.windll.user32
+    SW_RESTORE = 9
+    if target.desktop_number is not None:
+        current_desktop = VirtualDesktop.current()
+        if current_desktop.number != target.desktop_number:
+            VirtualDesktop(number=target.desktop_number).go()
+            # Let Windows display the target desktop before attempting to activate its window.
+            time.sleep(FOCUS_SETTLE_SECONDS)
+    if user32.IsIconic(target.hwnd):
+        user32.ShowWindow(target.hwnd, SW_RESTORE)
+    user32.BringWindowToTop(target.hwnd)
+    user32.SetForegroundWindow(target.hwnd)
+    time.sleep(0.10)
+    return user32.GetForegroundWindow() == target.hwnd
+
+
+if __name__ == "__main__":
+    VoiceNotesApp().run()

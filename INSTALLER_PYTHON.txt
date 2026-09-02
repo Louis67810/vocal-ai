@@ -1,0 +1,8 @@
+Python 3.10, 3.11 ou 3.12 est necessaire.
+
+Le PC contient actuellement Anaconda Python 3.8.3, qui est trop ancien pour
+la version locale de Whisper utilisee ici.
+
+Installez une version recente de Python pour votre utilisateur Windows, sans
+droits administrateur : pendant l'installation, choisissez "Install Now".
+Ensuite, fermez et rouvrez ce dossier, puis double-cliquez sur install.bat.
