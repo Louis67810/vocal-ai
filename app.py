@@ -211,15 +211,16 @@ class ErrorOverlay:
         self.card = self.shade = None
 
 
-class DiagnosticWindow:
+class ControlWindow:
     """Always-visible session log so startup and transcription are inspectable."""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, app: "VoiceNotesApp") -> None:
         self.window = tk.Toplevel(root, bg="#161616")
-        self.window.title("Journal de diagnostic — Voice Notes")
-        self.window.geometry("720x380+80+80")
+        self.app = app
+        self.window.title("Voice Notes")
+        self.window.geometry("720x510+80+80")
         self.window.minsize(500, 240)
-        self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
+        self.window.protocol("WM_DELETE_WINDOW", app.close)
 
         header = tk.Label(
             self.window,
@@ -230,6 +231,7 @@ class DiagnosticWindow:
             padx=16,
             pady=12,
         )
+        header.configure(text="Voice Notes - commandes et journal")
         header.pack(anchor="w")
         tk.Label(
             self.window,
@@ -239,6 +241,27 @@ class DiagnosticWindow:
             font=("Segoe UI", 9),
             padx=16,
         ).pack(anchor="w", pady=(0, 10))
+
+        controls = tk.Frame(self.window, bg="#161616", padx=16)
+        controls.pack(fill="x", pady=(0, 10))
+        self.record_button = tk.Button(
+            controls, text="Démarrer l'enregistrement", command=app.toggle_recording,
+            bg="#2F7D4B", fg="#FFFFFF", activebackground="#25643C",
+            activeforeground="#FFFFFF", relief="flat", padx=16, pady=9,
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
+        )
+        self.record_button.pack(side="left")
+
+        hotkey = tk.Frame(self.window, bg="#202020", padx=16, pady=12)
+        hotkey.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(hotkey, text="Raccourci global", bg="#202020", fg="#FFFFFF", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(hotkey, text="Exemple : Ctrl+Shift+R. Le bouton fonctionne sans raccourci.", bg="#202020", fg="#B8B8B8", font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(2, 8))
+        self.hotkey_var = tk.StringVar(value=app.hotkey_display)
+        tk.Entry(hotkey, textvariable=self.hotkey_var, bg="#0D0D0D", fg="#FFFFFF", insertbackground="#FFFFFF", relief="flat", font=("Segoe UI", 10), width=30).grid(row=2, column=0, sticky="ew", ipady=6)
+        tk.Button(hotkey, text="Appliquer", command=self.apply_hotkey, bg="#3C6EAA", fg="#FFFFFF", activebackground="#315A8B", activeforeground="#FFFFFF", relief="flat", padx=14, pady=7, cursor="hand2").grid(row=2, column=1, padx=(10, 0))
+        hotkey.columnconfigure(0, weight=1)
+        self.hotkey_status = tk.Label(hotkey, text="", bg="#202020", fg="#9BD6AA", font=("Segoe UI", 9))
+        self.hotkey_status.grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         content = tk.Frame(self.window, bg="#161616", padx=16, pady=8)
         content.pack(fill="both", expand=True)
@@ -260,11 +283,41 @@ class DiagnosticWindow:
         self.text.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=self.text.yview)
 
+    def apply_hotkey(self) -> None:
+        self.app.apply_hotkey(self.hotkey_var.get())
+
+    def set_hotkey_status(self, text: str, ok: bool) -> None:
+        self.hotkey_status.configure(text=text, fg="#9BD6AA" if ok else "#F29A9A")
+
+    def set_recording(self, recording: bool) -> None:
+        self.record_button.configure(
+            text="Arrêter l'enregistrement" if recording else "Démarrer l'enregistrement",
+            bg="#B44848" if recording else "#2F7D4B",
+            activebackground="#8E3838" if recording else "#25643C",
+        )
+
     def append(self, message: str) -> None:
         self.text.configure(state="normal")
         self.text.insert("end", message + "\n")
         self.text.see("end")
         self.text.configure(state="disabled")
+
+
+def normalize_hotkey(value: str) -> tuple[str, str]:
+    aliases = {"control": "ctrl", "option": "alt", "escape": "esc", "return": "enter", "espace": "space", "entrée": "enter"}
+    special = {"ctrl", "alt", "shift", "space", "enter", "tab", "esc", "cmd", "win"}
+    parts = [aliases.get(part.strip().lower(), part.strip().lower()) for part in value.split("+")]
+    if len(parts) < 2 or any(not part for part in parts):
+        raise ValueError("Utilisez au moins deux touches, par exemple Ctrl+Shift+R.")
+    rendered = []
+    for part in parts:
+        if part in special or (part.startswith("f") and part[1:].isdigit()):
+            rendered.append(f"<{part}>")
+        elif len(part) == 1 and part.isalnum():
+            rendered.append(part)
+        else:
+            raise ValueError(f"Touche non reconnue : {part}")
+    return "+".join(rendered), "+".join(part.title() if part != "ctrl" else "Ctrl" for part in parts)
 
 
 class VoiceNotesApp:
@@ -278,12 +331,14 @@ class VoiceNotesApp:
         self.paste_target: PasteTarget | None = None
         self.paste_keyboard = keyboard.Controller()
         self.last_hotkey_at = 0.0
+        self.hotkey = HOTKEY
+        self.hotkey_display = "Ctrl+Alt+Espace"
         self.logs: list[str] = []
         self.screen_width = self.screen_height = 0
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.diagnostic = DiagnosticWindow(self.root)
+        self.diagnostic = ControlWindow(self.root, self)
         self.error_overlay = ErrorOverlay(self.root, self.logs)
         self.toast = Toast(self.root, self.error_overlay.show)
         self.listener = None
@@ -295,11 +350,35 @@ class VoiceNotesApp:
         return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
 
     def on_ui_ready(self) -> None:
-        self.log(f"Application démarrée. Raccourci : {HOTKEY}")
+        self.log(f"Application démarrée. Raccourci : {self.hotkey_display}")
         self.log("Mode local : Whisper Base est chargé depuis le cache local.")
-        self.listener = keyboard.GlobalHotKeys({HOTKEY: self.on_hotkey, EXIT_HOTKEY: self.request_exit})
-        self.listener.start()
+        self.start_listener()
         self.toast.show("Prêt — Ctrl + Alt + Espace", "work", duration=3000)
+
+    def start_listener(self) -> None:
+        if self.listener:
+            self.listener.stop()
+        self.listener = keyboard.GlobalHotKeys({self.hotkey: self.on_hotkey, EXIT_HOTKEY: self.request_exit})
+        self.listener.start()
+
+    def apply_hotkey(self, value: str) -> None:
+        try:
+            hotkey, display = normalize_hotkey(value)
+            previous_hotkey, previous_display = self.hotkey, self.hotkey_display
+            self.hotkey, self.hotkey_display = hotkey, display
+            try:
+                self.start_listener()
+            except Exception:
+                self.hotkey, self.hotkey_display = previous_hotkey, previous_display
+                self.start_listener()
+                raise
+            self.diagnostic.hotkey_var.set(display)
+            self.diagnostic.set_hotkey_status(f"Raccourci appliqué : {display}", True)
+            self.log(f"Raccourci modifié : {display}")
+        except ValueError as exc:
+            self.diagnostic.set_hotkey_status(str(exc), False)
+        except Exception as exc:
+            self.diagnostic.set_hotkey_status(f"Impossible d'activer ce raccourci : {exc}", False)
 
     def copy_diagnostic(self) -> None:
         pyperclip.copy("\n".join(self.logs[-20:]))
@@ -369,6 +448,7 @@ class VoiceNotesApp:
             self.stream = sd.InputStream(samplerate=self.capture_sample_rate, channels=1, dtype="float32", device=input_device, callback=callback)
             self.stream.start()
             self.recording = True
+            self.diagnostic.set_recording(True)
             device_name = device_info["name"]
             self.set_status(f"● ENREGISTREMENT ({device_name}, {self.capture_sample_rate} Hz) — refaites Ctrl+Alt+Espace pour terminer")
         except Exception as exc:
@@ -382,6 +462,7 @@ class VoiceNotesApp:
         self.stream.close()
         self.stream = None
         self.recording = False
+        self.diagnostic.set_recording(False)
         chunks = []
         while not self.audio_chunks.empty():
             chunks.append(self.audio_chunks.get_nowait())
