@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 HOTKEY = "<ctrl>+<alt>+<space>"
 EXIT_HOTKEY = "<ctrl>+<alt>+<shift>+<space>"
+QUESTION_HOTKEY = "<ctrl>+<alt>+q"
 WHISPER_SAMPLE_RATE = 16_000
 # Use the Windows default input device.  Hard-coding a PortAudio index makes the
 # app silently target the wrong device as soon as an audio interface is added,
@@ -51,6 +52,9 @@ passages ambigus s'ils font partie du discours. Si tu n'es pas certain d'une cor
 garde le texte original."""
 FOCUS_SETTLE_SECONDS = 0.35
 WEB_UI = os.environ.get("VOICE_NOTES_WEB") == "1"
+QUESTION_PROMPT = """Tu es un assistant de cours. Reponds uniquement a partir du contexte fourni.
+Si le contexte ne permet pas de repondre, indique-le clairement. Reponds en francais avec une
+reponse courte, puis des puces utiles. N'invente aucune source."""
 
 # ASCII source text avoids passing legacy mojibake characters to the local models.
 WHISPER_INITIAL_PROMPT = (
@@ -511,6 +515,13 @@ class VoiceNotesApp:
         self.web_notice: dict | None = None
         self.web_recording = False
         self.web_hotkey_status = {"text": "", "ok": True}
+        self.question_hotkey = QUESTION_HOTKEY
+        self.question_hotkey_display = "Ctrl+Alt+Q"
+        self.question_stream: sd.InputStream | None = None
+        self.question_recording = False
+        self.question_audio_chunks: queue.Queue[np.ndarray] = queue.Queue()
+        self.question_context: list[dict] = []
+        self.web_question = {"status": "idle", "question": "", "answer": ""}
         self.web_server: ThreadingHTTPServer | None = None
         self.logs: list[str] = []
         self.screen_width = self.screen_height = 0
@@ -563,7 +574,7 @@ class VoiceNotesApp:
     def start_listener(self) -> None:
         if self.listener:
             self.listener.stop()
-        self.listener = keyboard.GlobalHotKeys({self.hotkey: self.on_hotkey, EXIT_HOTKEY: self.request_exit})
+        self.listener = keyboard.GlobalHotKeys({self.hotkey: self.on_hotkey, self.question_hotkey: self.on_question_hotkey, EXIT_HOTKEY: self.request_exit})
         self.listener.start()
 
     def apply_hotkey(self, value: str) -> None:
@@ -616,7 +627,7 @@ class VoiceNotesApp:
         notice = self.web_notice
         if notice and notice.get("expiresAt") and notice["expiresAt"] < time.time():
             self.web_notice = notice = None
-        return repair_display_text({"recording": self.recording, "busy": self.transcribing, "shortcut": self.hotkey_display, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
+        return repair_display_text({"recording": self.recording, "busy": self.transcribing, "shortcut": self.hotkey_display, "questionShortcut": self.question_hotkey_display, "question": self.web_question, "context": self.question_context, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
 
     def run_web_server(self) -> None:
         owner = self
@@ -626,13 +637,19 @@ class VoiceNotesApp:
                 body = json.dumps(data, ensure_ascii=False).encode("utf-8")
                 self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             def do_GET(self):
-                self.send_json(owner.web_state() if self.path == "/state" else {"error": "not found"}, 200 if self.path == "/state" else 404)
+                if self.path == "/state": return self.send_json(owner.web_state())
+                if self.path == "/context-candidates": return self.send_json({"items": owner.context_candidates()})
+                self.send_json({"error": "not found"}, 404)
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/toggle": owner.toggle_recording()
                 elif self.path == "/start": owner.start_recording()
                 elif self.path == "/stop": owner.stop_recording()
                 elif self.path == "/hotkey": owner.apply_hotkey(payload.get("value", ""))
+                elif self.path == "/question-toggle": owner.toggle_question()
+                elif self.path == "/question-hotkey": owner.apply_question_hotkey(payload.get("value", ""))
+                elif self.path == "/context": owner.set_question_context(payload.get("items", []))
+                elif self.path == "/question-close": owner.web_question = {"status": "idle", "question": "", "answer": ""}
                 else: return self.send_json({"error": "not found"}, 404)
                 self.send_json(owner.web_state())
         self.on_ui_ready()
@@ -645,6 +662,106 @@ class VoiceNotesApp:
             return
         self.last_hotkey_at = now
         self.ui(self.toggle_recording)
+
+    def on_question_hotkey(self) -> None:
+        self.ui(self.toggle_question)
+
+    def apply_question_hotkey(self, value: str) -> None:
+        try:
+            hotkey, display = normalize_hotkey(value)
+            previous, previous_display = self.question_hotkey, self.question_hotkey_display
+            self.question_hotkey, self.question_hotkey_display = hotkey, display
+            try:
+                self.start_listener()
+            except Exception:
+                self.question_hotkey, self.question_hotkey_display = previous, previous_display
+                self.start_listener()
+                raise
+            self.log(f"Raccourci question modifie : {display}")
+        except Exception as exc:
+            self.log(f"Raccourci question invalide : {exc}")
+
+    def context_candidates(self) -> list[dict]:
+        items = []
+        for target in list_open_document_windows():
+            items.append({"id": f"window:{target.hwnd}", "title": target.title, "type": document_type(target.title), "text": ""})
+        try:
+            clipboard = pyperclip.paste().strip()
+            if clipboard:
+                items.insert(0, {"id": "selection:clipboard", "title": "Texte selectionne", "type": "selection", "text": clipboard[:12000]})
+        except Exception:
+            pass
+        return items[:12]
+
+    def set_question_context(self, items: list[dict]) -> None:
+        self.question_context = [
+            {"id": str(item.get("id", "")), "title": str(item.get("title", "Contexte"))[:160], "type": str(item.get("type", "document")), "text": str(item.get("text", ""))[:12000]}
+            for item in items if isinstance(item, dict)
+        ][:12]
+        self.log(f"Contexte question sauvegarde : {len(self.question_context)} element(s).")
+
+    def toggle_question(self) -> None:
+        if self.question_recording:
+            self.stop_question()
+        else:
+            self.start_question()
+
+    def start_question(self) -> None:
+        if self.recording or self.transcribing or self.question_recording:
+            self.log("Question ignoree : une operation vocale est deja en cours.")
+            return
+        try:
+            while not self.question_audio_chunks.empty(): self.question_audio_chunks.get_nowait()
+            input_device = INPUT_DEVICE if INPUT_DEVICE is not None else sd.default.device[0]
+            device = sd.query_devices(input_device)
+            self.capture_sample_rate = int(device["default_samplerate"])
+            self.question_stream = sd.InputStream(samplerate=self.capture_sample_rate, channels=1, dtype="float32", device=input_device, callback=lambda indata, *_args: self.question_audio_chunks.put(indata.copy()))
+            self.question_stream.start()
+            self.question_recording = True
+            self.web_question = {"status": "listening", "question": "", "answer": ""}
+            self.toast.show("Ecoute de la question", "recording", duration=None)
+            self.log("Ecoute de la question demarree.")
+        except Exception as exc:
+            self.show_error(32, "Erreur du microphone", "La question ne peut pas etre enregistree.", "Verifiez le micro et les autorisations Windows.", str(exc))
+
+    def stop_question(self) -> None:
+        if not self.question_stream: return
+        self.question_stream.stop(); self.question_stream.close(); self.question_stream = None
+        self.question_recording = False
+        self.web_question = {"status": "thinking", "question": "", "answer": ""}
+        threading.Thread(target=self.transcribe_question_and_answer, daemon=True).start()
+
+    def transcribe_question_and_answer(self) -> None:
+        chunks = []
+        while not self.question_audio_chunks.empty(): chunks.append(self.question_audio_chunks.get_nowait())
+        if not chunks:
+            self.ui(self.show_error, 48, "Pas de son entendu", "Aucune question audio n'a ete recue.", "Verifiez le volume du microphone.")
+            self.web_question = {"status": "idle", "question": "", "answer": ""}; return
+        audio = np.concatenate(chunks, axis=0).reshape(-1)
+        try:
+            model = self.ensure_whisper_model()
+            segments, _info = model.transcribe(resample_for_whisper(audio, self.capture_sample_rate), language=LANGUAGE, vad_filter=True, beam_size=5, initial_prompt=WHISPER_INITIAL_PROMPT)
+            question = clean_text(" ".join(segment.text.strip() for segment in segments))
+            if not question: raise ValueError("Question vide")
+            answer = self.answer_question_with_context(question)
+            self.web_question = {"status": "answer", "question": question, "answer": answer}
+            self.ui(self.toast.show, "Reponse prete", "success", 2000)
+            self.ui(self.log, f"Question : {question}")
+        except Exception as exc:
+            self.web_question = {"status": "error", "question": "", "answer": ""}
+            self.ui(self.show_error, 121, "Erreur de reponse", "La question n'a pas pu etre traitee.", "Consultez le journal de diagnostic.", str(exc))
+
+    def answer_question_with_context(self, question: str) -> str:
+        blocks = []
+        for item in self.question_context:
+            excerpt = item.get("text") or f"Document ouvert : {item.get('title', 'Sans titre')}"
+            blocks.append(f"### {item.get('title', 'Contexte')}\n{excerpt}")
+        context = "\n\n".join(blocks) or "Aucun contexte selectionne."
+        payload = json.dumps({"model": LLM_MODEL_NAME, "stream": False, "keep_alive": "5m", "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": 700}, "messages": [{"role": "system", "content": QUESTION_PROMPT}, {"role": "user", "content": f"CONTEXTE:\n{context}\n\nQUESTION:\n{question}"}]}).encode("utf-8")
+        request = urllib.request.Request("http://127.0.0.1:11434/api/chat", data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            answer = json.loads(response.read().decode("utf-8")).get("message", {}).get("content", "").strip()
+        return answer or "Je n'ai pas pu produire de reponse a partir du contexte selectionne."
 
     def request_exit(self) -> None:
         self.ui(self.close)
@@ -959,6 +1076,31 @@ def window_title(hwnd: int) -> str:
     buffer = ctypes.create_unicode_buffer(length + 1)
     ctypes.windll.user32.GetWindowTextW(hwnd, buffer, len(buffer))
     return buffer.value or "Fenêtre sans titre"
+
+
+def document_type(title: str) -> str:
+    lower = title.casefold()
+    if "onenote" in lower: return "onenote"
+    if "word" in lower or "winword" in lower: return "word"
+    if "pdf" in lower or "acrobat" in lower: return "pdf"
+    return "document"
+
+
+def list_open_document_windows() -> list[PasteTarget]:
+    """List document-like top-level windows; their text is added only when the user supplies it."""
+    user32 = ctypes.windll.user32
+    results: list[PasteTarget] = []
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def visit(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd): return True
+        title = window_title(hwnd)
+        if title and title != "Fenêtre sans titre" and not "voice notes" in title.casefold():
+            kind = document_type(title)
+            if kind != "document" or "chrome" in title.casefold() or "edge" in title.casefold():
+                results.append(PasteTarget(hwnd=hwnd, title=title, desktop_number=None))
+        return True
+    user32.EnumWindows(callback_type(visit), 0)
+    return results
 
 
 def remember_active_window() -> PasteTarget | None:
