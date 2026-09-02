@@ -495,6 +495,7 @@ class VoiceNotesApp:
         self.audio_chunks: queue.Queue[np.ndarray] = queue.Queue()
         self.stream: sd.InputStream | None = None
         self.model: WhisperModel | None = None
+        self.model_lock = threading.Lock()
         self.transcribing = False
         self.streaming_thread: threading.Thread | None = None
         self.session_segments: list[str] = []
@@ -538,6 +539,7 @@ class VoiceNotesApp:
     def on_ui_ready(self) -> None:
         self.log("Mode progressif : Whisper Small + Qwen 2.5 1.5B local sont prets.")
         self.log(f"Application démarrée. Raccourci : {self.hotkey_display}")
+        threading.Thread(target=self.preload_whisper_model, daemon=True).start()
         self.start_listener()
         self.toast.show("Prêt — Ctrl + Alt + Espace", "work", duration=3000)
 
@@ -576,7 +578,7 @@ class VoiceNotesApp:
         if "erreur" in lower or "silencieux" in lower or "aucun texte" in lower:
             self.show_error(121, "Erreur inconnue", value, "Consultez les paramètres ou copiez le diagnostic pour obtenir de l'aide.")
         elif "enregistrement" in lower:
-            self.toast.show("Écoute de la question", "recording", duration=None)
+            self.toast.show("Transcription...", "work", duration=3000)
         elif "collée" in lower:
             self.toast.show("Transcription ajoutée", "success", duration=2000)
         else:
@@ -743,14 +745,26 @@ class VoiceNotesApp:
             self.ui(self.show_error, 121, "Erreur de transcription", "La transcription progressive n'a pas pu etre terminee.", "Communiquez le code et la reference technique si le probleme persiste.", technical)
             self.transcribing = False
 
+    def preload_whisper_model(self) -> None:
+        try:
+            self.ensure_whisper_model()
+            self.ui(self.log, "Whisper Small est pret pour la transcription.")
+        except Exception as exc:
+            self.ui(self.log, f"Prechargement de Whisper Small echoue : {exc}")
+
+    def ensure_whisper_model(self) -> WhisperModel:
+        with self.model_lock:
+            if self.model is None:
+                self.ui(self.log, "Chargement de Whisper Small en arriere-plan…")
+                self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+            return self.model
+
     def process_stream_segment(self, audio: np.ndarray, index: int) -> None:
-        if self.model is None:
-            self.ui(self.log, "Chargement de Whisper Small…")
-            self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+        model = self.ensure_whisper_model()
         duration = len(audio) / self.capture_sample_rate
         resampled = resample_for_whisper(audio, self.capture_sample_rate)
         self.ui(self.log, f"Transcription du segment {index} ({duration:.0f} s)…")
-        segments, _info = self.model.transcribe(
+        segments, _info = model.transcribe(
             resampled, language=LANGUAGE, vad_filter=True, beam_size=5, initial_prompt=WHISPER_INITIAL_PROMPT,
         )
         raw = " ".join(segment.text.strip() for segment in segments).strip()
