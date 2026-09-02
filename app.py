@@ -8,6 +8,7 @@ import traceback
 import tkinter as tk
 import ctypes
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pyperclip
@@ -52,6 +53,11 @@ class PasteTarget:
 class Toast:
     """A 296x46 status tag, deliberately kept separate from the diagnostic overlay."""
     WIDTH, HEIGHT = 296, 46
+    ASSET_DIR = Path(__file__).with_name("assets")
+    APP_ICON_FILES = {
+        "word": "0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png",
+        "onenote": "af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png",
+    }
 
     def __init__(self, root: tk.Tk, open_details) -> None:
         self.root = root
@@ -68,11 +74,19 @@ class Toast:
         self.after_id: str | None = None
         self.shimmer_id: str | None = None
         self.shimmer_phase = 0
+        self.motion_generation = 0
         self.visible = False
         self.error_details: dict | None = None
         self.photo: ImageTk.PhotoImage | None = None
         self.current_text = ""
         self.current_kind = "work"
+        self.target_app: str | None = None
+        self.app_icons: dict[str, Image.Image] = {}
+        for name, filename in self.APP_ICON_FILES.items():
+            path = self.ASSET_DIR / filename
+            if path.exists():
+                with Image.open(path) as source:
+                    self.app_icons[name] = source.convert("RGBA")
         self.canvas.bind("<Button-1>", self._click)
         self.window.withdraw()
 
@@ -104,8 +118,13 @@ class Toast:
         else:
             bubble, ink, symbol, color = "#F4F4F4", "#6E6E6E", "•", "#454545"
         draw.ellipse((xy(7), xy(7), xy(39), xy(39)), fill=bubble)
-        icon_font = self._font(xy(16 if kind != "work" else 22), True)
-        draw.text((xy(23), xy(22)), symbol, anchor="mm", fill=ink, font=icon_font)
+        app_icon = self.app_icons.get(self.target_app or "") if kind == "success" else None
+        if app_icon:
+            logo = app_icon.resize((xy(16), xy(16)), Image.Resampling.LANCZOS)
+            image.alpha_composite(logo, (xy(15), xy(15)))
+        else:
+            icon_font = self._font(xy(16 if kind != "work" else 22), True)
+            draw.text((xy(23), xy(22)), symbol, anchor="mm", fill=ink, font=icon_font)
         draw.text((xy(47), xy(23)), text, anchor="lm", fill=text_color or color, font=self._font(xy(11), True))
         if kind == "error":
             draw.ellipse((xy(261), xy(13), xy(281), xy(33)), fill="#756767")
@@ -120,6 +139,7 @@ class Toast:
             self.open_details(self.error_details)
 
     def show(self, text: str, kind: str = "work", duration: int | None = 3000, details: dict | None = None) -> None:
+        self.motion_generation += 1
         if self.after_id:
             self.root.after_cancel(self.after_id)
         if self.shimmer_id:
@@ -131,19 +151,30 @@ class Toast:
         self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{self._position(True)[0]}+{self._position(True)[1]}")
         self.window.deiconify()
         self.visible = True
-        self._slide_in(0)
+        self._slide_in(0, self.motion_generation)
         if kind == "work":
             self._shimmer("")
         if duration is not None:
             self.after_id = self.root.after(duration, self.hide)
 
-    def _slide_in(self, step: int) -> None:
+    def set_target_application(self, window_title: str) -> None:
+        title = window_title.lower()
+        if "onenote" in title:
+            self.target_app = "onenote"
+        elif "word" in title or "winword" in title:
+            self.target_app = "word"
+        else:
+            self.target_app = None
+
+    def _slide_in(self, step: int, generation: int) -> None:
+        if generation != self.motion_generation:
+            return
         x, target_y = self._position()
         _, start_y = self._position(True)
         y = int(start_y + (target_y - start_y) * min(step, 12) / 12)
         self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
         if step < 12:
-            self.root.after(12, self._slide_in, step + 1)
+            self.root.after(12, self._slide_in, step + 1, generation)
 
     def _shimmer(self, base: str) -> None:
         colors = ("#232323", "#545454", "#8C8C8C", "#545454")
@@ -155,8 +186,22 @@ class Toast:
         if self.shimmer_id:
             self.root.after_cancel(self.shimmer_id)
             self.shimmer_id = None
-        self.window.withdraw()
-        self.visible = False
+        if self.visible:
+            self.motion_generation += 1
+            self._slide_out(0, self.motion_generation)
+
+    def _slide_out(self, step: int, generation: int) -> None:
+        if generation != self.motion_generation:
+            return
+        x, start_y = self._position()
+        _, target_y = self._position(True)
+        y = int(start_y + (target_y - start_y) * min(step, 12) / 12)
+        self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        if step < 12:
+            self.root.after(12, self._slide_out, step + 1, generation)
+        else:
+            self.window.withdraw()
+            self.visible = False
 
 
 class ErrorOverlay:
@@ -166,6 +211,7 @@ class ErrorOverlay:
         self.shade: tk.Toplevel | None = None
         self.card: tk.Toplevel | None = None
         self.drag = (0, 0)
+        self.animation_generation = 0
 
     def show(self, details: dict | None) -> None:
         if not details:
@@ -173,13 +219,13 @@ class ErrorOverlay:
         self.close()
         self.shade = tk.Toplevel(self.root, bg="#000000")
         self.shade.overrideredirect(True)
-        self.shade.attributes("-alpha", 0.42, "-topmost", True)
+        self.shade.attributes("-alpha", 0.0, "-topmost", True)
         self.shade.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
         self.shade.bind("<Button-1>", lambda _event: self.close())
         self.card = tk.Toplevel(self.root, bg="#191919")
         self.card.overrideredirect(True)
         self.card.attributes("-topmost", True)
-        self.card.geometry("373x275+108+443")
+        self.card.geometry("373x275+108+461")
         self.card.bind("<Button-1>", self._drag_start)
         self.card.bind("<B1-Motion>", self._drag_move)
         frame = tk.Frame(self.card, bg="#191919", padx=24, pady=20)
@@ -193,6 +239,18 @@ class ErrorOverlay:
         copy = tk.Label(frame, text=f"{details['help']}\n\n{hint}", bg="#191919", fg="#A8A8A8", justify="left", wraplength=310, font=("Inter", 10), cursor="hand2")
         copy.pack(anchor="w")
         copy.bind("<Button-1>", lambda _event: self.copy(details))
+        self.animation_generation += 1
+        self._animate_in(0, self.animation_generation)
+
+    def _animate_in(self, step: int, generation: int) -> None:
+        if generation != self.animation_generation or not self.shade or not self.card:
+            return
+        progress = min(step, 10) / 10
+        self.shade.attributes("-alpha", 0.42 * progress)
+        y = 443 + int(18 * (1 - progress))
+        self.card.geometry(f"373x275+108+{y}")
+        if step < 10:
+            self.root.after(16, self._animate_in, step + 1, generation)
 
     def copy(self, details: dict) -> None:
         pyperclip.copy("\n".join(self.logs[-20:]) + f"\nCode : #{details['code']}")
@@ -205,6 +263,7 @@ class ErrorOverlay:
             self.card.geometry(f"+{event.x_root-self.drag[0]}+{event.y_root-self.drag[1]}")
 
     def close(self) -> None:
+        self.animation_generation += 1
         for window in (self.card, self.shade):
             if window and window.winfo_exists():
                 window.destroy()
@@ -429,6 +488,7 @@ class VoiceNotesApp:
         try:
             self.paste_target = remember_active_window()
             if self.paste_target:
+                self.toast.set_target_application(self.paste_target.title)
                 desktop = self.paste_target.desktop_number
                 self.log(f"Cible mémorisée : {self.paste_target.title} (bureau {desktop or '?'})")
             else:
