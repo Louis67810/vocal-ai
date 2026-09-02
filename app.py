@@ -130,6 +130,23 @@ class Toast:
         else:
             draw.ellipse((xy(20), xy(20), xy(26), xy(26)), fill=ink)
 
+    def _draw_shimmer_label(self, image: Image.Image, text: str, scale: int) -> None:
+        """A moving highlight clipped to the label, matching the Figma shimmer."""
+        width, height = image.size
+        mask = Image.new("L", (width, height), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.text((47 * scale, 23 * scale), text, anchor="lm", fill=255, font=self._font(11 * scale, True))
+        gradient = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        gradient_draw = ImageDraw.Draw(gradient)
+        travel = width + 120 * scale
+        center = (self.shimmer_phase * 18 * scale) % travel - 60 * scale
+        for x in range(width):
+            distance = min(1.0, abs(x - center) / (70 * scale))
+            brightness = int(35 + (140 - 35) * (1.0 - distance) ** 2)
+            gradient_draw.line((x, 0, x, height), fill=(brightness, brightness, brightness, 255))
+        gradient.putalpha(mask)
+        image.alpha_composite(gradient)
+
     def _render(self, text: str, kind: str, text_color: str | None = None) -> None:
         """Draw at 4x then downsample: native Tk canvas arcs are visibly pixelated."""
         scale = 4
@@ -156,7 +173,10 @@ class Toast:
             image.alpha_composite(logo, (xy(15), xy(15)))
         else:
             self._draw_status_icon(draw, kind, ink, scale)
-        draw.text((xy(47), xy(23)), text, anchor="lm", fill=text_color or color, font=self._font(xy(11), True))
+        if kind == "work":
+            self._draw_shimmer_label(image, text, scale)
+        else:
+            draw.text((xy(47), xy(23)), text, anchor="lm", fill=text_color or color, font=self._font(xy(11), True))
         if kind == "error":
             draw.ellipse((xy(261), xy(13), xy(281), xy(33)), fill="#756767")
             draw.text((xy(271), xy(23)), "?", anchor="mm", fill="#FFFFFF", font=self._font(xy(11), True))
@@ -208,10 +228,9 @@ class Toast:
             self.root.after(12, self._slide_in, step + 1, generation)
 
     def _shimmer(self, base: str) -> None:
-        colors = ("#232323", "#545454", "#8C8C8C", "#545454")
-        self._render(self.current_text, self.current_kind, colors[self.shimmer_phase % len(colors)])
+        self._render(self.current_text, self.current_kind)
         self.shimmer_phase += 1
-        self.shimmer_id = self.root.after(110, self._shimmer, base)
+        self.shimmer_id = self.root.after(50, self._shimmer, base)
 
     def hide(self) -> None:
         if self.shimmer_id:
