@@ -802,7 +802,7 @@ class VoiceNotesApp:
         """Use Qwen locally when available; raw Whisper text remains the safe fallback."""
         if self.llm_available is False:
             return clean_text(text)
-        self.ui(self.toast.show, "Mise en forme locale...", "refining", 2500)
+        self.ui(self.log, f"Mise en forme locale du segment {index}…")
         payload = json.dumps({
             "model": LLM_MODEL_NAME,
             "stream": False,
