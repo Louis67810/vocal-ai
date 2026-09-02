@@ -597,7 +597,7 @@ class VoiceNotesApp:
         notice = self.web_notice
         if notice and notice.get("expiresAt") and notice["expiresAt"] < time.time():
             self.web_notice = notice = None
-        return repair_display_text({"recording": self.recording, "shortcut": self.hotkey_display, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
+        return repair_display_text({"recording": self.recording, "busy": self.transcribing, "shortcut": self.hotkey_display, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
 
     def run_web_server(self) -> None:
         owner = self
@@ -611,6 +611,8 @@ class VoiceNotesApp:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/toggle": owner.toggle_recording()
+                elif self.path == "/start": owner.start_recording()
+                elif self.path == "/stop": owner.stop_recording()
                 elif self.path == "/hotkey": owner.apply_hotkey(payload.get("value", ""))
                 else: return self.send_json({"error": "not found"}, 404)
                 self.send_json(owner.web_state())
@@ -636,7 +638,7 @@ class VoiceNotesApp:
 
     def start_recording(self) -> None:
         if self.transcribing:
-            self.set_status("Transcription encore en cours — attendez le résultat")
+            self.log("Demande de demarrage ignoree : finalisation encore en cours.")
             return
         try:
             self.paste_target = remember_active_window()
@@ -681,7 +683,7 @@ class VoiceNotesApp:
         self.stream = None
         self.recording = False
         self.diagnostic.set_recording(False)
-        self.set_status("Finalisation des derniers segments…")
+        self.log("Finalisation des derniers segments en arriere-plan.")
         return
         if not self.stream:
             return
@@ -743,11 +745,11 @@ class VoiceNotesApp:
 
     def process_stream_segment(self, audio: np.ndarray, index: int) -> None:
         if self.model is None:
-            self.ui(self.set_status, "Chargement de Whisper Small…")
+            self.ui(self.log, "Chargement de Whisper Small…")
             self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
         duration = len(audio) / self.capture_sample_rate
         resampled = resample_for_whisper(audio, self.capture_sample_rate)
-        self.ui(self.set_status, f"Transcription du segment {index} ({duration:.0f} s)…")
+        self.ui(self.log, f"Transcription du segment {index} ({duration:.0f} s)…")
         segments, _info = self.model.transcribe(
             resampled, language=LANGUAGE, vad_filter=True, beam_size=5, initial_prompt=WHISPER_INITIAL_PROMPT,
         )
