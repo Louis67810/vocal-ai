@@ -211,6 +211,62 @@ class ErrorOverlay:
         self.card = self.shade = None
 
 
+class DiagnosticWindow:
+    """Always-visible session log so startup and transcription are inspectable."""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.window = tk.Toplevel(root, bg="#161616")
+        self.window.title("Journal de diagnostic — Voice Notes")
+        self.window.geometry("720x380+80+80")
+        self.window.minsize(500, 240)
+        self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
+
+        header = tk.Label(
+            self.window,
+            text="Journal de diagnostic — Voice Notes",
+            bg="#161616",
+            fg="#FFFFFF",
+            font=("Segoe UI", 12, "bold"),
+            padx=16,
+            pady=12,
+        )
+        header.pack(anchor="w")
+        tk.Label(
+            self.window,
+            text="Cette fenêtre reste ouverte pendant l'utilisation. Les erreurs et les transcriptions y apparaissent.",
+            bg="#161616",
+            fg="#B8B8B8",
+            font=("Segoe UI", 9),
+            padx=16,
+        ).pack(anchor="w", pady=(0, 10))
+
+        content = tk.Frame(self.window, bg="#161616", padx=16, pady=8)
+        content.pack(fill="both", expand=True)
+        scrollbar = tk.Scrollbar(content)
+        scrollbar.pack(side="right", fill="y")
+        self.text = tk.Text(
+            content,
+            bg="#0D0D0D",
+            fg="#E8E8E8",
+            insertbackground="#FFFFFF",
+            bd=0,
+            padx=12,
+            pady=10,
+            font=("Cascadia Mono", 9),
+            wrap="word",
+            state="disabled",
+            yscrollcommand=scrollbar.set,
+        )
+        self.text.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.text.yview)
+
+    def append(self, message: str) -> None:
+        self.text.configure(state="normal")
+        self.text.insert("end", message + "\n")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+
 class VoiceNotesApp:
     def __init__(self) -> None:
         self.recording = False
@@ -227,6 +283,7 @@ class VoiceNotesApp:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.diagnostic = DiagnosticWindow(self.root)
         self.error_overlay = ErrorOverlay(self.root, self.logs)
         self.toast = Toast(self.root, self.error_overlay.show)
         self.listener = None
@@ -265,8 +322,10 @@ class VoiceNotesApp:
 
     def log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
-        self.logs.append(f"[{stamp}] {message}")
+        entry = f"[{stamp}] {message}"
+        self.logs.append(entry)
         self.logs[:] = self.logs[-100:]
+        self.diagnostic.append(entry)
 
     def on_hotkey(self) -> None:
         now = time.monotonic()
@@ -385,6 +444,8 @@ class VoiceNotesApp:
         if self.listener:
             self.listener.stop()
         self.error_overlay.close()
+        if self.diagnostic.window.winfo_exists():
+            self.diagnostic.window.destroy()
         if self.toast.window.winfo_exists():
             self.toast.window.destroy()
         if self.root.winfo_exists():
