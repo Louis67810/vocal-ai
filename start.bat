@@ -2,6 +2,15 @@
 cd /d "%~dp0"
 echo.
 echo === Demarrage OneNote Voice Notes ===
+if not exist node_modules\electron (
+  echo L'interface React n'est pas encore installee.
+  echo Double-cliquez d'abord sur install.bat.
+  pause
+  exit /b 1
+)
+call npm.cmd run start
+exit /b 0
+rem Ancien lanceur Python conserve ci-dessous pour reference.
 if not exist .venv\Scripts\pythonw.exe (
   echo L'application n'est pas encore installee.
   echo Double-cliquez d'abord sur install.bat puis lisez le message affiche.

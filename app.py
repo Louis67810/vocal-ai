@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import queue
+import json
+import os
 import threading
 import time
 import traceback
 import tkinter as tk
 import ctypes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +44,18 @@ provenant de paroles superposées. Conserve les hésitations, les phrases incomp
 passages ambigus s'ils font partie du discours. Si tu n'es pas certain d'une correction,
 garde le texte original."""
 FOCUS_SETTLE_SECONDS = 0.35
+WEB_UI = os.environ.get("VOICE_NOTES_WEB") == "1"
+
+
+def repair_display_text(value):
+    if isinstance(value, str):
+        try:
+            return value.encode("latin1").decode("utf-8")
+        except UnicodeError:
+            return value
+    if isinstance(value, list): return [repair_display_text(item) for item in value]
+    if isinstance(value, dict): return {key: repair_display_text(item) for key, item in value.items()}
+    return value
 
 
 def apply_rounded_window_region(window: tk.Toplevel, width: int, height: int, radius: int) -> None:
@@ -430,6 +445,32 @@ def normalize_hotkey(value: str) -> tuple[str, str]:
     return "+".join(rendered), "+".join(part.title() if part != "ctrl" else "Ctrl" for part in parts)
 
 
+class WebControls:
+    def __init__(self, app: "VoiceNotesApp") -> None:
+        self.app = app
+
+    def append(self, _message: str) -> None: pass
+    def set_hotkey_status(self, text: str, ok: bool) -> None:
+        self.app.web_hotkey_status = {"text": text, "ok": ok}
+    def set_recording(self, recording: bool) -> None:
+        self.app.web_recording = recording
+
+
+class WebToast:
+    def __init__(self, app: "VoiceNotesApp") -> None:
+        self.app = app
+        self.target_app: str | None = None
+
+    def set_target_application(self, title: str) -> None:
+        title = title.lower()
+        self.target_app = "onenote" if "onenote" in title else "word" if "word" in title or "winword" in title else None
+
+    def show(self, text: str, kind: str = "work", duration: int | None = 3000, details: dict | None = None) -> None:
+        self.app.web_notice = {"text": text, "kind": kind, "app": self.target_app if kind == "success" else None, "details": details, "expiresAt": time.time() + duration / 1000 if duration else None}
+
+    def close(self) -> None: pass
+
+
 class VoiceNotesApp:
     def __init__(self) -> None:
         self.recording = False
@@ -443,18 +484,31 @@ class VoiceNotesApp:
         self.last_hotkey_at = 0.0
         self.hotkey = HOTKEY
         self.hotkey_display = "Ctrl+Alt+Espace"
+        self.web_notice: dict | None = None
+        self.web_recording = False
+        self.web_hotkey_status = {"text": "", "ok": True}
+        self.web_server: ThreadingHTTPServer | None = None
         self.logs: list[str] = []
         self.screen_width = self.screen_height = 0
-        self.root = tk.Tk()
-        self.root.withdraw()
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.diagnostic = ControlWindow(self.root, self)
-        self.error_overlay = ErrorOverlay(self.root, self.logs)
-        self.toast = Toast(self.root, self.error_overlay.show)
+        if WEB_UI:
+            self.root = None
+            self.diagnostic = WebControls(self)
+            self.error_overlay = None
+            self.toast = WebToast(self)
+        else:
+            self.root = tk.Tk()
+            self.root.withdraw()
+            self.root.protocol("WM_DELETE_WINDOW", self.close)
+            self.diagnostic = ControlWindow(self.root, self)
+            self.error_overlay = ErrorOverlay(self.root, self.logs)
+            self.toast = Toast(self.root, self.error_overlay.show)
         self.listener = None
 
     def ui(self, callback, *args) -> None:
-        self.root.after(0, callback, *args)
+        if WEB_UI:
+            callback(*args)
+        else:
+            self.root.after(0, callback, *args)
 
     def screen_size(self) -> tuple[int, int]:
         return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
@@ -482,7 +536,8 @@ class VoiceNotesApp:
                 self.hotkey, self.hotkey_display = previous_hotkey, previous_display
                 self.start_listener()
                 raise
-            self.diagnostic.hotkey_var.set(display)
+            if not WEB_UI:
+                self.diagnostic.hotkey_var.set(display)
             self.diagnostic.set_hotkey_status(f"Raccourci appliqué : {display}", True)
             self.log(f"Raccourci modifié : {display}")
         except ValueError as exc:
@@ -515,6 +570,31 @@ class VoiceNotesApp:
         self.logs.append(entry)
         self.logs[:] = self.logs[-100:]
         self.diagnostic.append(entry)
+
+    def web_state(self) -> dict:
+        notice = self.web_notice
+        if notice and notice.get("expiresAt") and notice["expiresAt"] < time.time():
+            self.web_notice = notice = None
+        return repair_display_text({"recording": self.recording, "shortcut": self.hotkey_display, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
+
+    def run_web_server(self) -> None:
+        owner = self
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args): pass
+            def send_json(self, data, status=200):
+                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            def do_GET(self):
+                self.send_json(owner.web_state() if self.path == "/state" else {"error": "not found"}, 200 if self.path == "/state" else 404)
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/toggle": owner.toggle_recording()
+                elif self.path == "/hotkey": owner.apply_hotkey(payload.get("value", ""))
+                else: return self.send_json({"error": "not found"}, 404)
+                self.send_json(owner.web_state())
+        self.on_ui_ready()
+        self.web_server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+        self.web_server.serve_forever()
 
     def on_hotkey(self) -> None:
         now = time.monotonic()
@@ -635,15 +715,19 @@ class VoiceNotesApp:
             self.stream.close()
         if self.listener:
             self.listener.stop()
+        if WEB_UI:
+            if self.web_server:
+                threading.Thread(target=self.web_server.shutdown, daemon=True).start()
+            return
         self.error_overlay.close()
-        if self.diagnostic.window.winfo_exists():
-            self.diagnostic.window.destroy()
-        if self.toast.window.winfo_exists():
-            self.toast.window.destroy()
-        if self.root.winfo_exists():
-            self.root.destroy()
+        if self.diagnostic.window.winfo_exists(): self.diagnostic.window.destroy()
+        if self.toast.window.winfo_exists(): self.toast.window.destroy()
+        if self.root.winfo_exists(): self.root.destroy()
 
     def run(self) -> None:
+        if WEB_UI:
+            self.run_web_server()
+            return
         self.root.after(0, self.on_ui_ready)
         self.root.mainloop()
 

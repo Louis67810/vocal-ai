@@ -29,6 +29,13 @@ exit /b 1
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+where npm >nul 2>nul
+if errorlevel 1 (
+  echo Node.js est necessaire pour l'interface React. Installez la version LTS depuis nodejs.org.
+  pause
+  exit /b 1
+)
+npm.cmd install
 echo.
 echo Installation terminee. Lancez start.bat.
 pause

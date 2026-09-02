@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 git-portable.exe
+node_modules/
+dist/
+.electron-data/
+.venv-python314-backup/
