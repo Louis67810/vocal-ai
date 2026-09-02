@@ -26,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 HOTKEY = "<ctrl>+<alt>+<space>"
 EXIT_HOTKEY = "<ctrl>+<alt>+<shift>+<space>"
 QUESTION_HOTKEY = "<ctrl>+<alt>+q"
+CONTEXT_HOTKEY = "<ctrl>+<alt>+c"
 WHISPER_SAMPLE_RATE = 16_000
 # Use the Windows default input device.  Hard-coding a PortAudio index makes the
 # app silently target the wrong device as soon as an audio interface is added,
@@ -517,11 +518,14 @@ class VoiceNotesApp:
         self.web_hotkey_status = {"text": "", "ok": True}
         self.question_hotkey = QUESTION_HOTKEY
         self.question_hotkey_display = "Ctrl+Alt+Q"
+        self.context_hotkey = CONTEXT_HOTKEY
+        self.context_hotkey_display = "Ctrl+Alt+C"
         self.question_stream: sd.InputStream | None = None
         self.question_recording = False
         self.question_audio_chunks: queue.Queue[np.ndarray] = queue.Queue()
         self.question_context: list[dict] = []
         self.web_question = {"status": "idle", "question": "", "answer": ""}
+        self.web_panels = {"context": False}
         self.web_server: ThreadingHTTPServer | None = None
         self.logs: list[str] = []
         self.screen_width = self.screen_height = 0
@@ -574,7 +578,7 @@ class VoiceNotesApp:
     def start_listener(self) -> None:
         if self.listener:
             self.listener.stop()
-        self.listener = keyboard.GlobalHotKeys({self.hotkey: self.on_hotkey, self.question_hotkey: self.on_question_hotkey, EXIT_HOTKEY: self.request_exit})
+        self.listener = keyboard.GlobalHotKeys({self.hotkey: self.on_hotkey, self.question_hotkey: self.on_question_hotkey, self.context_hotkey: self.on_context_hotkey, EXIT_HOTKEY: self.request_exit})
         self.listener.start()
 
     def apply_hotkey(self, value: str) -> None:
@@ -627,7 +631,7 @@ class VoiceNotesApp:
         notice = self.web_notice
         if notice and notice.get("expiresAt") and notice["expiresAt"] < time.time():
             self.web_notice = notice = None
-        return repair_display_text({"recording": self.recording, "busy": self.transcribing, "shortcut": self.hotkey_display, "questionShortcut": self.question_hotkey_display, "question": self.web_question, "context": self.question_context, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
+        return repair_display_text({"recording": self.recording, "busy": self.transcribing, "shortcut": self.hotkey_display, "questionShortcut": self.question_hotkey_display, "contextShortcut": self.context_hotkey_display, "question": self.web_question, "context": self.question_context, "panels": self.web_panels, "notice": notice, "logs": self.logs[-100:], "hotkeyStatus": self.web_hotkey_status})
 
     def run_web_server(self) -> None:
         owner = self
@@ -648,7 +652,10 @@ class VoiceNotesApp:
                 elif self.path == "/hotkey": owner.apply_hotkey(payload.get("value", ""))
                 elif self.path == "/question-toggle": owner.toggle_question()
                 elif self.path == "/question-hotkey": owner.apply_question_hotkey(payload.get("value", ""))
+                elif self.path == "/context-hotkey": owner.apply_context_hotkey(payload.get("value", ""))
                 elif self.path == "/context": owner.set_question_context(payload.get("items", []))
+                elif self.path == "/context-panel-open": owner.web_panels["context"] = True
+                elif self.path == "/context-panel-close": owner.web_panels["context"] = False
                 elif self.path == "/question-close": owner.web_question = {"status": "idle", "question": "", "answer": ""}
                 else: return self.send_json({"error": "not found"}, 404)
                 self.send_json(owner.web_state())
@@ -666,6 +673,13 @@ class VoiceNotesApp:
     def on_question_hotkey(self) -> None:
         self.ui(self.toggle_question)
 
+    def on_context_hotkey(self) -> None:
+        self.ui(self.toggle_context_panel)
+
+    def toggle_context_panel(self) -> None:
+        self.web_panels["context"] = not self.web_panels.get("context", False)
+        self.log("Panneau de contexte " + ("ouvert." if self.web_panels["context"] else "ferme."))
+
     def apply_question_hotkey(self, value: str) -> None:
         try:
             hotkey, display = normalize_hotkey(value)
@@ -680,6 +694,21 @@ class VoiceNotesApp:
             self.log(f"Raccourci question modifie : {display}")
         except Exception as exc:
             self.log(f"Raccourci question invalide : {exc}")
+
+    def apply_context_hotkey(self, value: str) -> None:
+        try:
+            hotkey, display = normalize_hotkey(value)
+            previous, previous_display = self.context_hotkey, self.context_hotkey_display
+            self.context_hotkey, self.context_hotkey_display = hotkey, display
+            try:
+                self.start_listener()
+            except Exception:
+                self.context_hotkey, self.context_hotkey_display = previous, previous_display
+                self.start_listener()
+                raise
+            self.log(f"Raccourci contexte modifie : {display}")
+        except Exception as exc:
+            self.log(f"Raccourci contexte invalide : {exc}")
 
     def context_candidates(self) -> list[dict]:
         items = []
@@ -699,6 +728,7 @@ class VoiceNotesApp:
             for item in items if isinstance(item, dict)
         ][:12]
         self.log(f"Contexte question sauvegarde : {len(self.question_context)} element(s).")
+        self.web_panels["context"] = False
 
     def toggle_question(self) -> None:
         if self.question_recording:
