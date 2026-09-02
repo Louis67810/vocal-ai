@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { CheckIcon, EllipsisHorizontalIcon, ExclamationTriangleIcon, InformationCircleIcon, MicrophoneIcon, SpeakerWaveIcon } from '@heroicons/react/24/solid'
+import { CheckIcon, DocumentTextIcon, EllipsisHorizontalIcon, ExclamationTriangleIcon, InformationCircleIcon, MicrophoneIcon, SpeakerWaveIcon } from '@heroicons/react/24/solid'
 import './styles.css'
 
 const officeAsset = { word: './0877fc4cdb9ff70b4647ad05d5aba6684812b1f4.png', onenote: './af2a6280cc6e6d04267283dd9a5d00d2fad440fc.png' }
@@ -9,6 +9,7 @@ function StatusIcon({ notice }) {
   if (notice.app) return <img src={officeAsset[notice.app]} />
   if (notice.kind === 'success') return <CheckIcon />
   if (notice.kind === 'recording') return <MicrophoneIcon />
+  if (notice.kind === 'transcribing') return <DocumentTextIcon />
   if (notice.kind === 'error' && notice.details?.code === 48) return <SpeakerWaveIcon />
   if (notice.kind === 'error') return <ExclamationTriangleIcon />
   return <EllipsisHorizontalIcon />

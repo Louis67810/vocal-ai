@@ -503,6 +503,7 @@ class VoiceNotesApp:
         self.llm_available: bool | None = None
         self.capture_sample_rate = 48_000
         self.paste_target: PasteTarget | None = None
+        self.last_external_target: PasteTarget | None = None
         self.paste_keyboard = keyboard.Controller()
         self.last_hotkey_at = 0.0
         self.hotkey = HOTKEY
@@ -540,7 +541,23 @@ class VoiceNotesApp:
         self.log("Mode progressif : Whisper Small + Qwen 2.5 1.5B local sont prets.")
         self.log(f"Application démarrée. Raccourci : {self.hotkey_display}")
         threading.Thread(target=self.preload_whisper_model, daemon=True).start()
+        threading.Thread(target=self.track_external_target, daemon=True).start()
         self.start_listener()
+
+    @staticmethod
+    def is_voice_notes_window(target: PasteTarget | None) -> bool:
+        return bool(target and "voice notes" in target.title.casefold())
+
+    def track_external_target(self) -> None:
+        """Keep the last document window so clicking Electron's Start button does not steal the paste target."""
+        while True:
+            try:
+                candidate = remember_active_window()
+                if candidate and not self.is_voice_notes_window(candidate):
+                    self.last_external_target = candidate
+            except Exception:
+                pass
+            time.sleep(0.20)
         self.toast.show("Prêt — Ctrl + Alt + Espace", "work", duration=3000)
 
     def start_listener(self) -> None:
@@ -578,7 +595,7 @@ class VoiceNotesApp:
         if "erreur" in lower or "silencieux" in lower or "aucun texte" in lower:
             self.show_error(121, "Erreur inconnue", value, "Consultez les paramètres ou copiez le diagnostic pour obtenir de l'aide.")
         elif "enregistrement" in lower:
-            self.toast.show("Transcription...", "work", duration=3000)
+            self.toast.show("Transcription...", "transcribing", duration=3000)
         elif "collée" in lower:
             self.toast.show("Transcription ajoutée", "success", duration=2000)
         else:
@@ -643,7 +660,8 @@ class VoiceNotesApp:
             self.log("Demande de demarrage ignoree : finalisation encore en cours.")
             return
         try:
-            self.paste_target = remember_active_window()
+            active_target = remember_active_window()
+            self.paste_target = self.last_external_target if self.is_voice_notes_window(active_target) else active_target
             if self.paste_target:
                 self.toast.set_target_application(self.paste_target.title)
                 desktop = self.paste_target.desktop_number
