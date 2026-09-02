@@ -536,6 +536,7 @@ class VoiceNotesApp:
         return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
 
     def on_ui_ready(self) -> None:
+        self.log("Mode progressif : Whisper Small + Qwen 2.5 1.5B local sont prets.")
         self.log(f"Application démarrée. Raccourci : {self.hotkey_display}")
         self.log("Mode local : Whisper Base est chargé depuis le cache local.")
         self.start_listener()
